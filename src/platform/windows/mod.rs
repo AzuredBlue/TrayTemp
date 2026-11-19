@@ -1,3 +1,4 @@
+mod autostart;
 mod elevation;
 mod font;
 mod icon;
@@ -249,6 +250,10 @@ impl State {
             }
             menu::ID_CPU => self.toggle(Kind::Cpu),
             menu::ID_GPU => self.toggle(Kind::Gpu),
+            menu::ID_AUTOSTART => {
+                self.app.settings.autostart = !self.app.settings.autostart;
+                FollowUp::Autostart
+            }
             menu::ID_RETRY_DRIVER if self.cpu_driver_failed => FollowUp::StartCpu,
             _ => match menu::interval_for(id) {
                 Some(s) => {
@@ -313,6 +318,8 @@ enum FollowUp {
     /// CPU was enabled, or the driver install is retried.
     StartCpu,
     CpuDisabled,
+    /// "Start with Windows" was toggled.
+    Autostart,
 }
 
 /// Runs what a menu command left to do, with the state released: the dialogs, the UAC
@@ -338,6 +345,19 @@ fn follow_up(hwnd: HWND, follow: FollowUp) {
             offer_uninstall();
             if let Some(s) = with_state(|st| st.app.settings.clone()) {
                 elevation_need_changed(&s);
+            }
+            false
+        }
+        FollowUp::Autostart => {
+            if let Some(s) = with_state(|st| st.app.settings.clone()) {
+                if let Err(e) = autostart::set_autostart(s.autostart, s.cpu_enabled) {
+                    error_box("Start with Windows could not be changed.", &e);
+                    // The checkmark follows what the system now does.
+                    with_state(|st| {
+                        st.app.settings.autostart = !s.autostart;
+                        let _ = st.app.settings.save();
+                    });
+                }
             }
             false
         }
@@ -368,8 +388,15 @@ fn offer_uninstall() {
 
 /// Hook for when enabling or disabling CPU changed whether TrayTemp needs to run elevated:
 /// autostart switches between its elevated and its plain form here. Called with the state
-/// released, so it may wait for other programs. Not wired up yet.
-fn elevation_need_changed(_settings: &Settings) {}
+/// released, so it may wait for other programs and for the UAC prompt.
+fn elevation_need_changed(settings: &Settings) {
+    if !settings.autostart {
+        return;
+    }
+    if let Err(e) = autostart::set_autostart(true, settings.cpu_enabled) {
+        error_box("Start with Windows could not be updated.", &e);
+    }
+}
 
 /// A TrayTemp message box, brought to the foreground. Runs a modal loop: never call it inside
 /// `with_state`.
@@ -537,6 +564,9 @@ pub fn run() {
         }
         cpu = start.sensor;
         cpu_driver_failed = start.failed;
+    }
+    if settings.autostart {
+        autostart::sync_at_startup(settings.cpu_enabled);
     }
     let gpu = settings.gpu_enabled.then(open_gpu_sensor).flatten();
     let mut app = App::new(settings, cpu, gpu);

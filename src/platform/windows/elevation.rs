@@ -60,7 +60,7 @@ pub fn is_elevated() -> bool {
 /// Starts `exe args` elevated through the UAC prompt, with the program's own folder as its
 /// working directory. Returns the process handle if `mask` asks for it, else null.
 /// Blocks while the prompt is open.
-fn runas(exe: &Path, args: &str, mask: u32) -> Result<HANDLE, Relaunch> {
+fn runas(exe: &Path, args: &str, mask: u32, show: i32) -> Result<HANDLE, Relaunch> {
     let file = wide(exe);
     let params = wide(args);
     let dir = exe.parent().map(wide);
@@ -72,7 +72,7 @@ fn runas(exe: &Path, args: &str, mask: u32) -> Result<HANDLE, Relaunch> {
         lpFile: file.as_ptr(),
         lpParameters: params.as_ptr(),
         lpDirectory: dir.as_ref().map_or(null(), |d| d.as_ptr()),
-        nShow: SW_SHOWNORMAL,
+        nShow: show,
         ..Default::default()
     };
     // SAFETY: ShellExecuteEx asks for COM on the calling thread. A repeated call only adds a
@@ -100,16 +100,16 @@ pub fn relaunch_elevated(args: &str) -> Relaunch {
     let Ok(exe) = std::env::current_exe() else {
         return Relaunch::Failed;
     };
-    match runas(&exe, args, 0) {
+    match runas(&exe, args, 0, SW_SHOWNORMAL) {
         Ok(_) => Relaunch::Started,
         Err(r) => r,
     }
 }
 
 /// Runs `exe args` elevated through the UAC prompt and waits for it to exit.
-/// Returns its exit code.
-pub fn run_elevated_and_wait(exe: &Path, args: &str) -> Result<u32, Relaunch> {
-    let process = runas(exe, args, SEE_MASK_NOCLOSEPROCESS)?;
+/// Returns its exit code. `show` is the SW_ value for its window.
+pub fn run_elevated_and_wait(exe: &Path, args: &str, show: i32) -> Result<u32, Relaunch> {
+    let process = runas(exe, args, SEE_MASK_NOCLOSEPROCESS, show)?;
     if process.is_null() {
         return Err(Relaunch::Failed);
     }

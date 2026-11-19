@@ -98,12 +98,7 @@ pub fn show(hwnd: HWND, s: &Settings, cpu_driver_failed: bool, x: i32, y: i32) -
         }
         AppendMenuW(menu, MF_POPUP, refresh as usize, w!("Refresh"));
         let autostart = flag(s.autostart, MF_CHECKED);
-        item(
-            menu,
-            MF_GRAYED | autostart,
-            ID_AUTOSTART,
-            w!("Start with Windows"),
-        );
+        item(menu, autostart, ID_AUTOSTART, w!("Start with Windows"));
         if cpu_driver_failed {
             item(menu, 0, ID_RETRY_DRIVER, w!("Retry CPU driver install"));
         }

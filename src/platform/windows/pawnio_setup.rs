@@ -38,6 +38,7 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION,
     STARTUPINFOW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows_sys::{s, w};
 
 use super::elevation::{self, is_elevated, wide, Relaunch};
@@ -56,7 +57,7 @@ const UNINSTALL_ARGS: &str = "-uninstall -silent";
 pub fn install() -> Result<(), String> {
     let setup = fetch_verified()?;
     // `setup` keeps the file locked until the installer has exited, then deletes it.
-    let code = run_and_wait(&setup.path, INSTALL_ARGS)?;
+    let code = run_and_wait(&setup.path, INSTALL_ARGS, 0)?;
     drop(setup);
     if code != 0 {
         Err(format!(
@@ -79,9 +80,9 @@ pub fn uninstall() -> Result<(), String> {
     // administrators can change Program Files, and the uninstaller may delete itself.
     verify(&open_locked(&exe)?, &exe)?;
     let code = if is_elevated() {
-        run_and_wait(&exe, UNINSTALL_ARGS)?
+        run_and_wait(&exe, UNINSTALL_ARGS, 0)?
     } else {
-        elevation::run_elevated_and_wait(&exe, UNINSTALL_ARGS).map_err(|r| match r {
+        elevation::run_elevated_and_wait(&exe, UNINSTALL_ARGS, SW_SHOWNORMAL).map_err(|r| match r {
             Relaunch::Cancelled => "Administrator permission was not given.".to_string(),
             _ => "The PawnIO uninstaller could not be started.".to_string(),
         })?
@@ -426,7 +427,8 @@ unsafe fn signer_cn(state: HANDLE) -> Option<String> {
 
 /// Runs `exe args` and waits for it to exit; returns its exit code. `exe` is absolute and
 /// quoted in the command line; the program's own folder is its working directory.
-fn run_and_wait(exe: &Path, args: &str) -> Result<u32, String> {
+/// `flags` are CreateProcess creation flags.
+pub(super) fn run_and_wait(exe: &Path, args: &str, flags: u32) -> Result<u32, String> {
     let app = wide(exe);
     let mut line = OsString::from("\"");
     line.push(exe);
@@ -448,7 +450,7 @@ fn run_and_wait(exe: &Path, args: &str) -> Result<u32, String> {
             null(),
             null(),
             0,
-            0,
+            flags,
             null(),
             dir.as_ref().map_or(null(), |d| d.as_ptr()),
             &si,
