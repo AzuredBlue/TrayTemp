@@ -12,7 +12,7 @@ use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, MAX_PATH, TRUST_E_NOSIGNATURE,
+    CloseHandle, GetLastError, LocalFree, HANDLE, MAX_PATH, TRUST_E_NOSIGNATURE,
 };
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
@@ -20,6 +20,10 @@ use windows_sys::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_STATUS_CODE,
 };
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Security::Cryptography::{
     szOID_COMMON_NAME, CertGetNameStringW, CERT_NAME_ATTR_TYPE,
 };
@@ -28,7 +32,7 @@ use windows_sys::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
     WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
-use windows_sys::Win32::Storage::FileSystem::{GetTempPathW, FILE_SHARE_READ};
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, GetTempPathW, FILE_SHARE_READ};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION,
@@ -156,13 +160,51 @@ fn fresh_dir() -> Result<PathBuf, String> {
         .map_or(0, |d| d.as_nanos());
     for i in 0..100 {
         let dir = base.join(format!("TrayTemp-{}-{stamp:x}-{i}", std::process::id()));
-        match std::fs::create_dir(&dir) {
+        match create_private_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("Couldn't create a temp folder: {e}")),
         }
     }
     Err("Couldn't create a temp folder.".into())
+}
+
+/// Creates `dir` owned by Administrators, with access for SYSTEM and Administrators only, not
+/// inherited from the user's temp folder. The elevated installer runs from it, so this user's
+/// unelevated processes must not be able to place DLLs next to it, swap the downloaded file or,
+/// as its owner, change its access. Needs elevation.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: a NUL-terminated SDDL literal; on success `sd` gets a LocalAlloc'd descriptor.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd,
+        bInheritHandle: 0,
+    };
+    let path = wide(dir);
+    // SAFETY: NUL-terminated path; `sa` and its descriptor live through the call, and the
+    // descriptor is freed once, after the error code is read.
+    unsafe {
+        let ok = CreateDirectoryW(path.as_ptr(), &sa);
+        let result = if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        LocalFree(sd);
+        result
+    }
 }
 
 /// A WinHTTP handle, closed on drop.
@@ -229,7 +271,7 @@ fn download(path: &Path) -> Result<(), String> {
     let mut status = 0u32;
     let mut len = size_of::<u32>() as u32;
     // SAFETY: with FLAG_NUMBER the status code is written as a u32 into `status`.
-    unsafe {
+    let ok = unsafe {
         WinHttpQueryHeaders(
             request.0,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -239,6 +281,9 @@ fn download(path: &Path) -> Result<(), String> {
             null_mut(),
         )
     };
+    if ok == 0 {
+        return Err(fail("reading the response"));
+    }
     if status != 200 {
         return Err(format!(
             "The download failed: the server answered {status}."
