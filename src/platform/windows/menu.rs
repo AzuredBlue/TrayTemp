@@ -9,7 +9,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
 };
 
-use crate::settings::{DisplayMode, Settings};
+use crate::settings::Settings;
 
 pub const ID_MODE_ICONS: u32 = 100;
 pub const ID_MODE_TEXT: u32 = 101;
@@ -45,8 +45,22 @@ unsafe fn item(menu: HMENU, flags: MENU_ITEM_FLAGS, id: u32, label: PCWSTR) {
     AppendMenuW(menu, MF_STRING | flags, id as usize, label);
 }
 
+/// Whether the text is shown on the taskbar, and whether it was tried and can't be.
+#[derive(Clone, Copy)]
+pub struct TextMode {
+    pub active: bool,
+    pub failed: bool,
+}
+
 /// Shows the context menu at screen point (x, y) and returns the chosen command.
-pub fn show(hwnd: HWND, s: &Settings, cpu_driver_failed: bool, x: i32, y: i32) -> Option<u32> {
+pub fn show(
+    hwnd: HWND,
+    s: &Settings,
+    cpu_driver_failed: bool,
+    text: TextMode,
+    x: i32,
+    y: i32,
+) -> Option<u32> {
     // SAFETY: every menu is created here and destroyed (with its submenus) before returning;
     // all labels are static NUL-terminated strings.
     unsafe {
@@ -55,20 +69,17 @@ pub fn show(hwnd: HWND, s: &Settings, cpu_driver_failed: bool, x: i32, y: i32) -
             return None;
         }
 
-        // Greyed items are wired up when their features land.
         let display = CreatePopupMenu();
         item(display, 0, ID_MODE_ICONS, w!("Tray icons"));
-        item(display, MF_GRAYED, ID_MODE_TEXT, w!("Taskbar text"));
-        let mode = match s.display_mode {
-            DisplayMode::TrayIcons => ID_MODE_ICONS,
-            DisplayMode::TaskbarText => ID_MODE_TEXT,
-        };
+        item(display, flag(text.failed, MF_GRAYED), ID_MODE_TEXT, w!("Taskbar text"));
+        // What is shown, not what is saved: they differ while the taskbar can't take the text.
+        let mode = if text.active { ID_MODE_TEXT } else { ID_MODE_ICONS };
         CheckMenuRadioItem(display, ID_MODE_ICONS, ID_MODE_TEXT, mode, MF_BYCOMMAND);
         AppendMenuW(menu, MF_POPUP, display as usize, w!("Display"));
         let all = flag(s.all_taskbars, MF_CHECKED);
         item(
             menu,
-            MF_GRAYED | all,
+            flag(!text.active, MF_GRAYED) | all,
             ID_ALL_TASKBARS,
             w!("Show on all taskbars"),
         );

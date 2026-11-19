@@ -282,82 +282,119 @@ pub fn render_glyph(kind: Kind, size: u32) -> Canvas {
     m.into_canvas(OUTLINED)
 }
 
-/// The strip's `54°` in the OS font, as tall as the strip allows.
-fn os_label(f: &mut OsFont, value: Option<i32>, height: u32) -> Option<AlphaMask> {
-    let text = format!("{}\u{b0}", value?.clamp(0, 999));
-    let px = f.fit(1, u32::MAX, height.saturating_sub(2))?;
+/// The strip's `54°` (`--` without a value) in the OS font at `px`.
+fn os_label(f: &mut OsFont, value: Option<i32>, px: u32) -> Option<AlphaMask> {
+    let text = match value {
+        Some(v) => format!("{}\u{b0}", v.clamp(0, 999)),
+        None => "--".to_string(),
+    };
     f.raster.rasterize(&text, px)
 }
 
-/// Taskbar-text strip: `[glyph] number°` per enabled sensor (outer `None` = disabled), in the
-/// given style; width 0 if none are enabled.
-/// Numbers use the OS font when there is one, else the bitmap font; `--` is always bitmap.
+/// A taskbar-text strip and where each sensor's segment lies in it.
+pub struct Strip {
+    pub canvas: Canvas,
+    /// Half-open x-range of each sensor's icon and label, indexed by `Kind::index()`;
+    /// `None` for a disabled sensor.
+    pub spans: [Option<(u32, u32)>; 2],
+}
+
+/// Icon-font code points for the CPU and GPU icons, indexed by `Kind::index()`: a chip, in both
+/// Segoe Fluent Icons and Segoe MDL2 Assets. Those fonts have no graphics-card glyph (the
+/// closest is a monitor), so the GPU icon is always the bitmap one.
+pub const ICON_CODE_POINTS: [Option<char>; 2] = [Some('\u{E950}'), None];
+
+/// Taskbar-text strip: `[icon] number°` per enabled sensor (outer `None` = disabled), text at
+/// `px` (em height) in a canvas `height` tall; width 0 if none are enabled.
+/// `font` draws the labels and `icons` the sensor icons (see `ICON_CODE_POINTS`); without them
+/// the bitmap digits and glyphs are used.
 pub fn render_text_strip(
     cpu: Option<Option<i32>>,
     gpu: Option<Option<i32>>,
+    px: u32,
     height: u32,
     mut font: Option<&mut OsFont>,
+    mut icons: Option<&mut OsFont>,
     style: TextStyle,
-) -> Canvas {
+) -> Strip {
     let groups: [(Kind, Option<Option<i32>>); 2] = [(Kind::Cpu, cpu), (Kind::Gpu, gpu)];
-    let labels = groups.map(|(_, v)| os_label(font.as_deref_mut()?, v?, height));
-    let s = (height.saturating_sub(2) / 7).max(1);
-    let gs = glyph_scale(height);
+    let labels = groups.map(|(_, v)| os_label(font.as_deref_mut()?, v?, px));
+    // Icons are a little larger than the text.
+    let icon_px = px * 4 / 3;
+    let icon_masks = groups.map(|(k, v)| {
+        v?;
+        let ch = ICON_CODE_POINTS[k.index()]?.to_string();
+        icons.as_deref_mut()?.raster.rasterize(&ch, icon_px)
+    });
+    // Bitmap fallbacks.
+    let s = (px * 2 / 3 / 7).max(1);
+    let gs = (px / 12).max(1);
     let glyph_w = 16 * gs;
-    let gap = 2 * s;
-    let group_gap = 5 * s;
+    let gap = px / 2;
+    let group_gap = px * 3 / 2;
     let deg_w = 3 * s;
+    let margin = u32::from(style.outline);
 
-    // First pass: total content width. The outline adds 1 px each side.
     let mut width = 0;
     let mut count = 0;
-    for ((_, v), label) in groups.iter().zip(&labels) {
-        if let Some(v) = v {
-            if count > 0 {
-                width += group_gap;
-            }
-            count += 1;
-            width += glyph_w + gap;
-            match label {
-                Some(t) => width += t.w,
-                None => {
-                    width += number_cells(*v, false) * s;
-                    if v.is_some() {
-                        width += s + deg_w;
-                    }
+    for (i, (_, v)) in groups.iter().enumerate() {
+        let Some(v) = v else { continue };
+        if count > 0 {
+            width += group_gap;
+        }
+        count += 1;
+        width += icon_masks[i].as_ref().map_or(glyph_w, |m| m.w) + gap;
+        match &labels[i] {
+            Some(t) => width += t.w,
+            None => {
+                width += number_cells(*v, false) * s;
+                if v.is_some() {
+                    width += s + deg_w;
                 }
             }
         }
     }
+    let mut spans = [None; 2];
     if count == 0 {
-        return Canvas { w: 0, h: height, px: Vec::new() };
+        return Strip { canvas: Canvas { w: 0, h: height, px: Vec::new() }, spans };
     }
 
-    let mut m = Mask::new(width + 2, height);
-    let mut x = 1;
+    let mut m = Mask::new(width + 2 * margin, height);
+    let mut x = margin as i32;
     let mut first = true;
-    for ((kind, v), label) in groups.iter().zip(&labels) {
+    for (i, (kind, v)) in groups.iter().enumerate() {
         let Some(v) = v else { continue };
         if !first {
             x += group_gap as i32;
         }
         first = false;
-        let gy = (height as i32 - (16 * gs) as i32) / 2;
-        m.blit(&glyph_rows(*kind), 16, x, gy, gs);
-        x += (glyph_w + gap) as i32;
-        if let Some(t) = label {
+        let start = x;
+        match &icon_masks[i] {
+            Some(t) => {
+                m.draw(t, x, (height as i32 - t.h as i32) / 2);
+                x += t.w as i32;
+            }
+            None => {
+                let gy = (height as i32 - (16 * gs) as i32) / 2;
+                m.blit(&glyph_rows(*kind), 16, x, gy, gs);
+                x += glyph_w as i32;
+            }
+        }
+        x += gap as i32;
+        if let Some(t) = &labels[i] {
             m.draw(t, x, (height as i32 - t.h as i32) / 2);
             x += t.w as i32;
-            continue;
+        } else {
+            let ty = (height as i32 - (7 * s) as i32) / 2;
+            x = draw_number(&mut m, *v, x, ty, s, false);
+            if v.is_some() {
+                m.blit(&widen_deg(), 3, x + s as i32, ty, s);
+                x += (s + deg_w) as i32;
+            }
         }
-        let ty = (height as i32 - (7 * s) as i32) / 2;
-        x = draw_number(&mut m, *v, x, ty, s, false);
-        if v.is_some() {
-            m.blit(&widen_deg(), 3, x + s as i32, ty, s);
-            x += (s + deg_w) as i32;
-        }
+        spans[i] = Some((start as u32, x as u32));
     }
-    m.into_canvas(style)
+    Strip { canvas: m.into_canvas(style), spans }
 }
 
 fn widen_deg() -> [u32; 3] {
@@ -409,5 +446,28 @@ mod tests {
         assert_eq!(ink_h(54), 13);
         assert_eq!(ink_h(11), 13);
         assert_eq!(ink_h(100), 8);
+    }
+
+    #[test]
+    fn strip_spans_cover_the_drawn_segments() {
+        let mut font = OsFont::new(Box::new(BoxFont));
+        let mut icons = OsFont::new(Box::new(BoxFont));
+        let style = TextStyle { fill: 0xFF_FFFF, outline: false };
+        for (cpu, gpu) in [(Some(Some(5)), Some(Some(54))), (Some(Some(100)), Some(None)), (None, Some(Some(61)))] {
+            let strip = render_text_strip(cpu, gpu, 12, 20, Some(&mut font), Some(&mut icons), style);
+            let c = &strip.canvas;
+            assert_eq!(strip.spans[0].is_some(), cpu.is_some());
+            assert_eq!(strip.spans[1].is_some(), gpu.is_some());
+            let inked = |x: u32| (0..c.h).any(|y| c.px[(y * c.w + x) as usize] >> 24 != 0);
+            for x in 0..c.w {
+                let inside = strip.spans.iter().flatten().any(|&(a, b)| (a..b).contains(&x));
+                assert!(inside || !inked(x), "ink outside the spans at {x}");
+            }
+            for &(a, b) in strip.spans.iter().flatten() {
+                assert!((a..b).any(inked), "empty span");
+                // The label is the last thing in a span and fills its end.
+                assert!(inked(b - 1));
+            }
+        }
     }
 }

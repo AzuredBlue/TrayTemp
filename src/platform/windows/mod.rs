@@ -5,6 +5,7 @@ mod icon;
 mod menu;
 mod pawnio_setup;
 mod power;
+mod taskbar;
 mod tray;
 
 use std::cell::Cell;
@@ -42,6 +43,7 @@ use crate::sensor::{Kind, Sensor};
 use crate::settings::{DisplayMode, Settings};
 use elevation::{is_elevated, wide, Relaunch};
 use font::GdiText;
+use taskbar::{Look, TaskbarText};
 use tray::{TrayIcons, WM_TRAY};
 
 const KINDS: [Kind; 2] = [Kind::Cpu, Kind::Gpu];
@@ -53,6 +55,9 @@ const WM_RECHECK: u32 = WM_APP + 3;
 /// Posted by the autostart worker: lParam is a `Box<String>` (from `Box::into_raw`) with what
 /// went wrong; the window procedure takes it over.
 const WM_AUTOSTART_ERROR: u32 = WM_APP + 4;
+/// Posted by a flow worker (see `run_flow`): lParam is a `Box<FlowDone>` (from `Box::into_raw`)
+/// that the window procedure takes over.
+const WM_FLOW_DONE: u32 = WM_APP + 5;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -74,21 +79,26 @@ struct State {
     /// CPU is enabled but its driver is missing or unusable, or TrayTemp isn't elevated.
     /// The menu then offers to retry.
     cpu_driver_failed: bool,
+    /// The taskbar-text strips, while that mode is shown (then there are no tray icons).
+    text: Option<TaskbarText>,
+    /// Taskbar text was tried and the main taskbar can't take it: the mode is greyed out.
+    text_failed: bool,
 }
 
 thread_local! {
     // Moved out while a handler runs: a message that re-enters the window procedure
     // (Shell_NotifyIconW can dispatch sent messages) finds it empty instead of aliasing it.
     static STATE: Cell<Option<State>> = const { Cell::new(None) };
-    /// Set while a CPU driver step shows a dialog, the UAC prompt or waits for an installer,
-    /// so the menu can't open again and start a second one.
+    /// Set from when a CPU driver step is started until its worker's result arrives, so the
+    /// menu can't open again and start a second one.
     static BUSY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Runs `f` on the state; `None` if a handler further up the stack has it.
 /// Never show a dialog or the UAC prompt, or wait for a process, inside `f`: their modal loops
 /// dispatch messages, which would find the state taken and repost themselves at 100 % CPU.
-/// Return what is left to do and run it after, as `on_tray` does with `FollowUp`.
+/// Return what is left to do and run it after, as `on_tray` does with `FollowUp`. Waits go to
+/// a worker (`run_flow`), never on the UI thread.
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let mut st = STATE.take()?;
     let r = f(&mut st);
@@ -119,13 +129,26 @@ fn icon_size() -> u32 {
 }
 
 impl State {
+    /// Runs `f` on the strips, if shown, with the current font and colours.
+    fn with_text<R>(&mut self, f: impl FnOnce(&mut TaskbarText, &App, &mut Look) -> R) -> Option<R> {
+        let mut look = Look { font: self.font.as_mut(), style: self.style };
+        Some(f(self.text.as_mut()?, &self.app, &mut look))
+    }
+
     fn show_icon(&mut self, k: Kind) {
+        if self.text.is_some() {
+            self.with_text(|t, app, look| t.redraw(app, look));
+            return;
+        }
         let canvas = render_value(self.app.shown(k), self.icon_size, self.font.as_mut(), self.style);
         self.tray.add(k, &canvas, self.app.tooltip(k));
     }
 
     /// One NIM_MODIFY per changed kind; renders only when the shown number changed.
     fn apply(&mut self, changes: Changes) {
+        if self.with_text(|t, app, look| t.tick(app, changes, look)).is_some() {
+            return;
+        }
         for k in KINDS {
             let i = k.index();
             if !self.app.enabled(k) || !(changes.value[i] || changes.tooltip[i]) {
@@ -185,20 +208,66 @@ impl State {
         true
     }
 
-    /// Redraws the icons if the icon size, the UI font or the taskbar theme changed.
-    fn recheck(&mut self) {
+    /// Redraws the icons or strips if the icon size, the UI font or the taskbar theme changed.
+    /// `full`: the displays or scaling changed, so the taskbars are looked up again too.
+    fn recheck(&mut self, full: bool) {
         let size = icon_size();
         let style = font::taskbar_style();
         let font_changed = self.reload_font(style);
-        if size == self.icon_size && style == self.style && !font_changed {
-            return;
-        }
+        let changed = size != self.icon_size || style != self.style || font_changed;
         self.icon_size = size;
         self.style = style;
+        // The taskbar wasn't ready earlier (or was gone): try the strips again.
+        if self.text.is_none()
+            && self.app.settings.display_mode == DisplayMode::TaskbarText
+            && self.try_text()
+        {
+            return;
+        }
+        if self.text.is_some() {
+            let all = self.app.settings.all_taskbars;
+            if full {
+                self.with_text(|t, app, look| t.relayout(all, app, look));
+            } else if changed {
+                self.with_text(|t, app, look| t.redraw(app, look));
+            }
+            return;
+        }
+        if !changed {
+            return;
+        }
         for k in KINDS {
             if self.app.enabled(k) {
                 let canvas = render_value(self.app.shown(k), size, self.font.as_mut(), self.style);
                 self.tray.update(k, Some(&canvas), None);
+            }
+        }
+    }
+
+    /// Shows the strips instead of the tray icons. False (and the mode is greyed out) if the
+    /// main taskbar can't take them.
+    fn try_text(&mut self) -> bool {
+        let (hwnd, all) = (self.hwnd, self.app.settings.all_taskbars);
+        let mut look = Look { font: self.font.as_mut(), style: self.style };
+        self.text = TaskbarText::create(hwnd, all, &self.app, &mut look);
+        self.text_failed = self.text.is_none();
+        if self.text.is_some() {
+            for k in KINDS {
+                self.tray.remove(k);
+            }
+        }
+        self.text.is_some()
+    }
+
+    /// Shows the tray icons instead of the strips.
+    fn use_icons(&mut self) {
+        if let Some(t) = self.text.take() {
+            t.destroy();
+        }
+        self.text_failed = false;
+        for k in KINDS {
+            if self.app.enabled(k) {
+                self.show_icon(k);
             }
         }
     }
@@ -216,6 +285,7 @@ impl State {
         if !*this {
             self.tray.remove(k);
             self.app.set_sensor(k, None);
+            self.with_text(|t, app, look| t.redraw(app, look));
             if k == Kind::Cpu {
                 self.cpu_driver_failed = false;
                 return FollowUp::CpuDisabled;
@@ -253,6 +323,20 @@ impl State {
             menu::ID_EXIT => return FollowUp::Exit,
             menu::ID_MODE_ICONS => {
                 self.app.settings.display_mode = DisplayMode::TrayIcons;
+                self.use_icons();
+                FollowUp::None
+            }
+            menu::ID_MODE_TEXT => {
+                // Stays on tray icons, saved as such, when the taskbar can't take the strips.
+                if self.text.is_none() && self.try_text() {
+                    self.app.settings.display_mode = DisplayMode::TaskbarText;
+                }
+                FollowUp::None
+            }
+            menu::ID_ALL_TASKBARS => {
+                let all = !self.app.settings.all_taskbars;
+                self.app.settings.all_taskbars = all;
+                self.with_text(|t, app, look| t.relayout(all, app, look));
                 FollowUp::None
             }
             menu::ID_CPU => self.toggle(Kind::Cpu),
@@ -286,6 +370,9 @@ impl State {
         for k in KINDS {
             self.tray.remove(k);
         }
+        if let Some(t) = self.text.take() {
+            t.destroy();
+        }
     }
 }
 
@@ -296,8 +383,10 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     }
     // Copy what the menu needs and release the state: the menu's modal loop dispatches
     // messages (timer ticks keep running while it is open).
-    let Some((settings, cpu_driver_failed)) =
-        with_state(|st| (st.app.settings.clone(), st.cpu_driver_failed))
+    let Some((settings, cpu_driver_failed, text)) = with_state(|st| {
+        let text = menu::TextMode { active: st.text.is_some(), failed: st.text_failed };
+        (st.app.settings.clone(), st.cpu_driver_failed, text)
+    })
     else {
         // SAFETY: plain post to our own window.
         unsafe { PostMessageW(hwnd, WM_TRAY, wp, lp) };
@@ -309,7 +398,7 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     // menu closes when the user clicks elsewhere.
     let cmd = unsafe {
         SetForegroundWindow(hwnd);
-        let cmd = menu::show(hwnd, &settings, cpu_driver_failed, x, y);
+        let cmd = menu::show(hwnd, &settings, cpu_driver_failed, text, x, y);
         PostMessageW(hwnd, WM_NULL, 0, 0);
         cmd
     };
@@ -329,31 +418,51 @@ enum FollowUp {
     Autostart,
 }
 
-/// Runs what a menu command left to do, with the state released: the dialogs, the UAC
-/// prompt and the waits for PawnIO's installer and uninstaller all happen here.
-fn follow_up(hwnd: HWND, follow: FollowUp) {
+/// What a flow worker came to; posted back as `WM_FLOW_DONE`.
+enum FlowDone {
+    /// `start_cpu`'s outcome; `None`: an elevated instance was started and this one exits.
+    Cpu(Option<CpuStart>),
+    /// The offer to uninstall PawnIO ended; true if it was uninstalled.
+    Uninstalled(bool),
+}
+
+/// Runs `flow` on a short-lived worker thread and posts its result to `hwnd`. The UI thread
+/// never waits: in taskbar-text mode our windows are children of Explorer's taskbar and share
+/// its input queue, so a blocked UI thread would freeze the taskbar. `BUSY` is set until the
+/// result is handled.
+fn run_flow(hwnd: HWND, flow: impl FnOnce() -> FlowDone + Send + 'static) {
     BUSY.set(true);
-    let exit = match follow {
-        FollowUp::None => false,
-        FollowUp::Exit => true,
-        FollowUp::StartCpu => match start_cpu(false) {
-            None => true,
-            Some(start) => {
-                if let Some(s) = with_state(|st| {
-                    st.cpu_started(start);
-                    st.app.settings.clone()
-                }) {
-                    elevation_need_changed(hwnd, &s);
-                }
-                false
+    let hwnd = hwnd as isize;
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let done = Box::into_raw(Box::new(flow()));
+        // SAFETY: plain post; on success the window takes the box, else we do.
+        unsafe {
+            if PostMessageW(hwnd as HWND, WM_FLOW_DONE, 0, done as LPARAM) == 0 {
+                drop(Box::from_raw(done));
             }
+        }
+    });
+    if spawned.is_err() {
+        BUSY.set(false);
+    }
+}
+
+/// Runs what a menu command left to do, with the state released. The dialogs, the UAC prompt
+/// and the waits for PawnIO's installer and uninstaller run on a worker (`run_flow`).
+fn follow_up(hwnd: HWND, follow: FollowUp) {
+    match follow {
+        FollowUp::None => {}
+        // SAFETY: the state is back in place, so WM_DESTROY can clean it up.
+        FollowUp::Exit => unsafe {
+            DestroyWindow(hwnd);
         },
+        FollowUp::StartCpu => run_flow(hwnd, || FlowDone::Cpu(start_cpu(false))),
         FollowUp::CpuDisabled => {
-            offer_uninstall();
-            if let Some(s) = with_state(|st| st.app.settings.clone()) {
+            if with_state(|st| st.app.settings.pawnio_installed_by_traytemp) == Some(true) {
+                run_flow(hwnd, || FlowDone::Uninstalled(offer_uninstall()));
+            } else if let Some(s) = with_state(|st| st.app.settings.clone()) {
                 elevation_need_changed(hwnd, &s);
             }
-            false
         }
         FollowUp::Autostart => {
             // The checkmark is the user's choice and stays when applying it fails; the error
@@ -363,30 +472,63 @@ fn follow_up(hwnd: HWND, follow: FollowUp) {
             {
                 autostart::request(hwnd, on, cpu);
             }
-            false
         }
-    };
-    BUSY.set(false);
-    if exit {
-        // SAFETY: the state is back in place, so WM_DESTROY can clean it up.
-        unsafe { DestroyWindow(hwnd) };
     }
 }
 
-/// After CPU was disabled: if TrayTemp installed PawnIO, offers to uninstall it.
-fn offer_uninstall() {
-    let ours = with_state(|st| st.app.settings.pawnio_installed_by_traytemp) == Some(true);
-    if !ours || message_box(UNINSTALL_PROMPT, MB_YESNO | MB_ICONQUESTION) != IDYES {
-        return;
-    }
-    match pawnio_setup::uninstall() {
-        Ok(()) => {
-            with_state(|st| {
+/// Applies a worker's result with a short `with_state`; the state is released again before
+/// the elevation hook runs.
+fn on_flow_done(hwnd: HWND, done: FlowDone) {
+    let mut done = Some(done);
+    let applied = with_state(|st| match done.take()? {
+        FlowDone::Cpu(None) => None,
+        FlowDone::Cpu(Some(start)) => {
+            st.cpu_started(start);
+            Some(st.app.settings.clone())
+        }
+        FlowDone::Uninstalled(removed) => {
+            if removed {
                 st.app.settings.pawnio_installed_by_traytemp = false;
                 let _ = st.app.settings.save();
-            });
+            }
+            Some(st.app.settings.clone())
         }
-        Err(e) => error_box("The CPU temperature driver could not be uninstalled.", &e),
+    });
+    match applied {
+        // The state is busy up the stack: handle the result again later.
+        None => {
+            let again = Box::into_raw(Box::new(done.take().expect("not consumed")));
+            // SAFETY: plain post to our own window; on failure the box is ours again.
+            unsafe {
+                if PostMessageW(hwnd, WM_FLOW_DONE, 0, again as LPARAM) == 0 {
+                    drop(Box::from_raw(again));
+                }
+            }
+        }
+        Some(None) => {
+            BUSY.set(false);
+            // SAFETY: the elevated instance took over; this one goes.
+            unsafe { DestroyWindow(hwnd) };
+        }
+        Some(Some(settings)) => {
+            BUSY.set(false);
+            elevation_need_changed(hwnd, &settings);
+        }
+    }
+}
+
+/// After CPU was disabled and TrayTemp had installed PawnIO: offers to uninstall it. Runs on a
+/// worker. True if it was uninstalled.
+fn offer_uninstall() -> bool {
+    if message_box(UNINSTALL_PROMPT, MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return false;
+    }
+    match pawnio_setup::uninstall() {
+        Ok(()) => true,
+        Err(e) => {
+            error_box("The CPU temperature driver could not be uninstalled.", &e);
+            false
+        }
     }
 }
 
@@ -559,10 +701,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAY_STATE => run_or_repost(hwnd, msg, wp, lp, |st| st.set_display(wp != 0)),
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            // Displays and scaling also change which taskbars there are.
+            let full = (msg != WM_SETTINGCHANGE) as usize;
             // SAFETY: plain post to our own window.
-            unsafe { PostMessageW(hwnd, WM_RECHECK, 0, 0) };
+            unsafe { PostMessageW(hwnd, WM_RECHECK, full, 0) };
         }
-        WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, State::recheck),
+        WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, |st| st.recheck(wp != 0)),
+        WM_FLOW_DONE => {
+            // SAFETY: posted by `run_flow` or `on_flow_done` with a `Box<FlowDone>` we now own.
+            let done = unsafe { Box::from_raw(lp as *mut FlowDone) };
+            on_flow_done(hwnd, *done);
+        }
         WM_AUTOSTART_ERROR => {
             // SAFETY: posted by `autostart::request`'s worker with a `Box<String>` we now own.
             let why = unsafe { Box::from_raw(lp as *mut String) };
@@ -578,7 +727,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             run_or_repost(hwnd, msg, wp, lp, |st| {
                 st.tray.readd_all();
-                st.recheck();
+                st.recheck(true);
             });
         }
         // SAFETY: default handling for everything else.
@@ -661,11 +810,15 @@ pub fn run() {
         display_on: true,
         power: 0,
         cpu_driver_failed,
+        text: None,
+        text_failed: false,
     };
     st.reload_font(st.style);
-    for k in KINDS {
-        if st.app.enabled(k) {
-            st.show_icon(k);
+    if st.app.settings.display_mode != DisplayMode::TaskbarText || !st.try_text() {
+        for k in KINDS {
+            if st.app.enabled(k) {
+                st.show_icon(k);
+            }
         }
     }
     st.start_timer();

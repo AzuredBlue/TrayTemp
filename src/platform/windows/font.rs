@@ -1,14 +1,18 @@
 //! Tray numbers in the system UI font, rasterised with GDI, coloured like taskbar text.
 
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 use windows_sys::w;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, SIZE};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LPARAM, SIZE};
+use windows_sys::Win32::Globalization::{
+    GetDateFormatEx, GetTimeFormatEx, DATE_SHORTDATE, TIME_NOSECONDS,
+};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, GdiFlush,
-    GetSysColor, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TextOutW,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_NATURAL_QUALITY, COLOR_WINDOWTEXT,
-    DIB_RGB_COLORS, FW_NORMAL, LOGFONTW, TRANSPARENT,
+    CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject,
+    EnumFontFamiliesExW, GdiFlush, GetDC, GetSysColor, GetTextExtentPoint32W, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CLEARTYPE_NATURAL_QUALITY, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DIB_RGB_COLORS, FW_NORMAL,
+    LOGFONTW, TEXTMETRICW, TRANSPARENT,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
@@ -70,6 +74,74 @@ pub fn ui_font() -> Option<LOGFONTW> {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, (&raw mut ncm).cast(), 0)
     };
     (ok != 0).then_some(ncm.lfMessageFont)
+}
+
+/// The system icon font: Segoe Fluent Icons (Windows 11) or Segoe MDL2 Assets (Windows 10),
+/// if either is installed.
+pub fn icon_font() -> Option<LOGFONTW> {
+    unsafe extern "system" fn found(_: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, l: LPARAM) -> i32 {
+        // SAFETY: `l` is the `bool` passed to EnumFontFamiliesExW below.
+        unsafe { *(l as *mut bool) = true };
+        0
+    }
+    for face in ["Segoe Fluent Icons", "Segoe MDL2 Assets"] {
+        let mut lf = LOGFONTW { lfCharSet: DEFAULT_CHARSET, ..Default::default() };
+        for (d, c) in lf.lfFaceName.iter_mut().zip(face.encode_utf16()) {
+            *d = c;
+        }
+        let mut exists = false;
+        // SAFETY: the screen DC is released again; the callback only writes through `exists`.
+        unsafe {
+            let dc = GetDC(null_mut());
+            EnumFontFamiliesExW(dc, &lf, Some(found), (&raw mut exists) as LPARAM, 0);
+            ReleaseDC(null_mut(), dc);
+        }
+        if exists {
+            return Some(lf);
+        }
+    }
+    None
+}
+
+/// Width in pixels of the clock's text (the widest of the short time and the short date, in
+/// the user's formats) in `font` at `px`: what the taskbar's own clock takes next to its padding.
+pub fn clock_text_width(font: LOGFONTW, px: u32) -> i32 {
+    let (mut time, mut date) = ([0u16; 64], [0u16; 64]);
+    // SAFETY: both buffers are 64 UTF-16 units, as the lengths say; null names mean the
+    // user's locale, and null format strings the locale's short formats.
+    let (nt, nd) = unsafe {
+        (
+            GetTimeFormatEx(null(), TIME_NOSECONDS, null(), null(), time.as_mut_ptr(), 64),
+            GetDateFormatEx(null(), DATE_SHORTDATE, null(), null(), date.as_mut_ptr(), 64, null()),
+        )
+    };
+    let mut lf = font;
+    lf.lfHeight = -(px as i32);
+    lf.lfWidth = 0;
+    // SAFETY: every handle is checked and released before returning.
+    unsafe {
+        let dc = CreateCompatibleDC(null_mut());
+        let f = CreateFontIndirectW(&lf);
+        let mut widest = 0;
+        if !dc.is_null() && !f.is_null() {
+            let old = SelectObject(dc, f);
+            for (text, n) in [(&time, nt), (&date, nd)] {
+                let mut ext = SIZE::default();
+                if n > 1 {
+                    GetTextExtentPoint32W(dc, text.as_ptr(), n - 1, &mut ext);
+                }
+                widest = widest.max(ext.cx);
+            }
+            SelectObject(dc, old);
+        }
+        if !f.is_null() {
+            DeleteObject(f);
+        }
+        if !dc.is_null() {
+            DeleteDC(dc);
+        }
+        widest
+    }
 }
 
 /// True if text in this 0xRRGGBB colour is light, by its luma.

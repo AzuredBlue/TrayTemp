@@ -14,7 +14,7 @@ use crate::sensor::Kind;
 /// Callback message for tray icon events.
 pub const WM_TRAY: u32 = WM_APP + 1;
 
-const TIP_LEN: usize = 128;
+pub(super) const TIP_LEN: usize = 128;
 
 /// One notification-area icon per kind. Keeps the current icon and tip so the icons can be
 /// added again after Explorer restarts.
@@ -30,7 +30,7 @@ fn uid(k: Kind) -> u32 {
 }
 
 /// Copies `tip` as NUL-terminated UTF-16, cut at a character boundary if it is too long.
-fn copy_tip(dst: &mut [u16; TIP_LEN], tip: &str) {
+pub(super) fn copy_tip(dst: &mut [u16; TIP_LEN], tip: &str) {
     let mut n = 0;
     for ch in tip.chars() {
         let mut buf = [0u16; 2];
