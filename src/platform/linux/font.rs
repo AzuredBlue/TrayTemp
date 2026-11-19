@@ -13,50 +13,78 @@ use crate::render::{AlphaMask, OsFont, TextRasterizer, TextStyle, OUTLINED};
 
 /// The number font and text style from the desktop's settings, reloaded when they change.
 pub struct DesktopText {
-    kdeglobals: PathBuf,
-    plasmarc: PathBuf,
-    /// Modification times of the two files when they were last read.
-    stamps: [Option<SystemTime>; 2],
+    /// Every file of both cascades with its modification time when last read: first the
+    /// `kdeglobals` files, then the `plasmarc` files, each in priority order.
+    files: Vec<(PathBuf, Option<SystemTime>)>,
+    /// How many of `files` are `kdeglobals` files.
+    globals: usize,
+    /// The family `font` was built for.
+    family: Option<String>,
     pub font: Option<OsFont>,
     pub style: TextStyle,
 }
 
 impl DesktopText {
     pub fn load() -> DesktopText {
+        let mut files: Vec<_> = config_files("kdeglobals")
+            .into_iter()
+            .map(|p| (p, None))
+            .collect();
+        let globals = files.len();
+        files.extend(config_files("plasmarc").into_iter().map(|p| (p, None)));
         let mut t = DesktopText {
-            kdeglobals: config_file("kdeglobals"),
-            plasmarc: config_file("plasmarc"),
-            stamps: [None, None],
+            files,
+            globals,
+            family: None,
             font: None,
             style: OUTLINED,
         };
-        t.stamps = t.stamps();
+        t.stamp();
         t.reload();
         t
     }
 
-    /// Rereads the settings if either file was modified since they were last read; true if so.
-    /// Costs two `stat` calls and no allocation when nothing changed.
+    /// Rereads the settings if any file changed, appeared or disappeared since they were last
+    /// read; true if so. Costs one `stat` per file and no allocation when nothing changed.
     pub fn refresh(&mut self) -> bool {
-        let stamps = self.stamps();
-        if stamps == self.stamps {
+        if !self.stamp() {
             return false;
         }
-        self.stamps = stamps;
         self.reload();
         true
     }
 
-    fn stamps(&self) -> [Option<SystemTime>; 2] {
-        [modified(&self.kdeglobals), modified(&self.plasmarc)]
+    /// Records every file's modification time; true if any differs from the last record.
+    fn stamp(&mut self) -> bool {
+        let mut changed = false;
+        for (path, stamp) in &mut self.files {
+            let now = modified(path);
+            changed |= now != *stamp;
+            *stamp = now;
+        }
+        changed
     }
 
     fn reload(&mut self) {
-        let globals = std::fs::read_to_string(&self.kdeglobals).unwrap_or_default();
-        let plasmarc = std::fs::read_to_string(&self.plasmarc).unwrap_or_default();
-        let family = font_family(&globals).unwrap_or("sans-serif");
-        self.font = FtText::new(family).map(|t| OsFont::new(Box::new(t)));
+        let read = |files: &[(PathBuf, Option<SystemTime>)]| -> Vec<String> {
+            files
+                .iter()
+                .map(|(p, _)| std::fs::read_to_string(p).unwrap_or_default())
+                .collect()
+        };
+        let (globals, plasmarc) = self.files.split_at(self.globals);
+        let (globals, plasmarc) = (read(globals), read(plasmarc));
+        let globals: Vec<&str> = globals.iter().map(String::as_str).collect();
+        let plasmarc: Vec<&str> = plasmarc.iter().map(String::as_str).collect();
         self.style = text_style(&globals, &plasmarc);
+        let family = font_family(&globals).unwrap_or("sans-serif");
+        if self.family.as_deref() != Some(family) {
+            // Drop the old face before resolving the new one, so the two are never mapped
+            // together.
+            self.font = None;
+            self.font = FtText::new(family).map(|t| OsFont::new(Box::new(t)));
+            self.family = Some(family.to_owned());
+        }
     }
 }
 
@@ -64,27 +92,30 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// `$XDG_CONFIG_HOME/name`, else `$HOME/.config/name`; an empty path (no file) if neither is set.
-fn config_file(name: &str) -> PathBuf {
-    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => match std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-            Some(home) => PathBuf::from(home).join(".config"),
-            None => return PathBuf::new(),
-        },
-    };
-    base.join(name)
+/// The places KDE looks for the config file `name`, highest priority first: `$XDG_CONFIG_HOME`
+/// (else `$HOME/.config`), then each of `$XDG_CONFIG_DIRS` (default `/etc/xdg`). Plasma's
+/// session prepends its look-and-feel defaults to the latter.
+fn config_files(name: &str) -> Vec<PathBuf> {
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty());
+    let home = var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".config")));
+    let dirs = var("XDG_CONFIG_DIRS").unwrap_or_else(|| "/etc/xdg".into());
+    let dirs = std::env::split_paths(&dirs).filter(|d| !d.as_os_str().is_empty());
+    home.into_iter().chain(dirs).map(|d| d.join(name)).collect()
 }
 
-/// The last value of `key` in `[group]` of a KDE config file, trimmed and unquoted.
+/// The last value of `key` in `[group]` of a KDE config file, trimmed and unquoted. Group and
+/// key names lose a `[$i]`-style marker; a locked system key doesn't outrank the user's file
+/// (KConfig's immutability isn't implemented).
 fn ini_value<'a>(text: &'a str, group: &str, key: &str) -> Option<&'a str> {
     let mut in_group = false;
     let mut value = None;
     for line in text.lines().map(str::trim) {
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_group = name == group;
+            in_group = name.split("][$").next() == Some(group);
         } else if let Some((k, v)) = line.split_once('=').filter(|_| in_group) {
-            if k.trim() == key {
+            if k.trim().split("[$").next() == Some(key) {
                 value = Some(v.trim().trim_matches('"'));
             }
         }
@@ -92,25 +123,32 @@ fn ini_value<'a>(text: &'a str, group: &str, key: &str) -> Option<&'a str> {
     value
 }
 
+/// `ini_value` over a cascade of files, highest priority first: the first file with the key wins.
+fn cascade_value<'a>(files: &[&'a str], group: &str, key: &str) -> Option<&'a str> {
+    files.iter().find_map(|text| ini_value(text, group, key))
+}
+
 /// The family of KDE's general font: the text before the first comma of a Qt font string
 /// such as `Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1`.
-fn font_family(kdeglobals: &str) -> Option<&str> {
-    let font = ini_value(kdeglobals, "General", "font")?;
+fn font_family<'a>(kdeglobals: &[&'a str]) -> Option<&'a str> {
+    let font = cascade_value(kdeglobals, "General", "font")?;
     let family = font.split(',').next()?.trim().trim_matches('"').trim();
     (!family.is_empty()).then_some(family)
 }
 
 /// Plain text in the colour scheme's window text colour when the panel uses Plasma's default
 /// theme (Breeze), which follows the colour scheme; otherwise white with an outline, which
-/// reads on any panel.
-fn text_style(kdeglobals: &str, plasmarc: &str) -> TextStyle {
-    let default_theme = matches!(ini_value(plasmarc, "Theme", "name"), None | Some("default"));
-    match ini_value(kdeglobals, "Colors:Window", "ForegroundNormal").and_then(rgb) {
-        Some(fill) if default_theme => TextStyle {
-            fill,
+/// reads on any panel. With no colour set anywhere it is Breeze's own default, 35,38,41, which
+/// is what Plasma draws in that case.
+fn text_style(kdeglobals: &[&str], plasmarc: &[&str]) -> TextStyle {
+    match cascade_value(plasmarc, "Theme", "name") {
+        None | Some("default") => TextStyle {
+            fill: cascade_value(kdeglobals, "Colors:Window", "ForegroundNormal")
+                .and_then(rgb)
+                .unwrap_or(0x23_2629),
             outline: false,
         },
-        _ => OUTLINED,
+        Some(_) => OUTLINED,
     }
 }
 
@@ -361,6 +399,9 @@ fn font_file(family: &CStr) -> Option<(CString, c_long)> {
             destroy(pattern);
         }
         config_destroy(config);
+        // Safe only because nothing else in this process uses fontconfig (ksni doesn't, and
+        // FreeType's harfbuzz doesn't), and fontconfig registers no destructors that would run
+        // after it is unloaded.
         fini();
         found
     }
@@ -472,29 +513,31 @@ mod tests {
     fn reads_font_family_and_text_colour() {
         let normal = "[General]\nfont=Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1\n\n\
                       [Colors:Window]\nForegroundNormal=35,38,41\n";
-        assert_eq!(font_family(normal), Some("Noto Sans"));
-        assert!(
-            text_style(normal, "")
-                == TextStyle {
-                    fill: 0x23_2629,
-                    outline: false
-                }
-        );
+        let plain = |fill| TextStyle {
+            fill,
+            outline: false,
+        };
+        assert_eq!(font_family(&[normal]), Some("Noto Sans"));
+        assert!(text_style(&[normal], &[]) == plain(0x23_2629));
+        // A Plasma theme other than the default doesn't follow the colour scheme.
+        assert!(text_style(&[normal], &["[Theme]\nname=breeze-twilight\n"]) == OUTLINED);
+        assert!(text_style(&[normal], &["[Theme]\nname=default\n"]) == plain(0x23_2629));
 
-        // The keys only appear elsewhere: defaults.
+        // The keys only appear elsewhere: the font defaults, and the colour is Breeze's own.
         let missing = "[General]\nfixed=Hack,10\n[Colors:View]\nForegroundNormal=1,2,3\n";
-        assert_eq!(font_family(missing), None);
-        assert!(text_style(missing, "") == OUTLINED);
+        assert_eq!(font_family(&[missing]), None);
+        assert!(text_style(&[missing], &[]) == plain(0x23_2629));
 
         let odd = "[General]\r\n  font = \"DejaVu Serif , 11\"\r\n\
                    [Colors:Window]\r\nForegroundNormal = 252, 252, 252\r\n";
-        assert_eq!(font_family(odd), Some("DejaVu Serif"));
-        assert!(
-            text_style(odd, "")
-                == TextStyle {
-                    fill: 0xFC_FCFC,
-                    outline: false
-                }
-        );
+        assert_eq!(font_family(&[odd]), Some("DejaVu Serif"));
+        assert!(text_style(&[odd], &[]) == plain(0xFC_FCFC));
+
+        // Cascade: the first file with the key wins; a file lacking it defers to the next.
+        let system =
+            "[General][$i]\nfont[$i]=Cantarell,11\n[Colors:Window]\nForegroundNormal=1,2,3\n";
+        assert_eq!(font_family(&[missing, system]), Some("Cantarell"));
+        assert_eq!(font_family(&[normal, system]), Some("Noto Sans"));
+        assert!(text_style(&[missing, system], &[]) == plain(0x01_0203));
     }
 }
