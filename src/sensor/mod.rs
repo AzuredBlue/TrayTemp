@@ -1,5 +1,8 @@
 //! Temperature sources. Platform-neutral core.
 
+#[cfg(target_os = "linux")]
+pub mod hwmon;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Cpu,
