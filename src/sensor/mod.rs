@@ -1,5 +1,8 @@
 //! Temperature sources. Platform-neutral core.
 
+pub mod cpu_decode;
+pub mod nvml;
+
 #[cfg(target_os = "linux")]
 pub mod hwmon;
 
