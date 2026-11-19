@@ -83,7 +83,9 @@ impl DesktopText {
             // together.
             self.font = None;
             self.font = FtText::new(family).map(|t| OsFont::new(Box::new(t)));
-            self.family = Some(family.to_owned());
+            // Remembered only once it loads, so a failed lookup is tried again on the next
+            // change to either file.
+            self.family = self.font.as_ref().map(|_| family.to_owned());
         }
     }
 }
@@ -330,8 +332,10 @@ impl FtText {
 
 /// The file and face index fontconfig picks for `family`, as it would for any app asking for
 /// that family at regular weight. Fontconfig is released entirely afterwards (`FcFini`, then
-/// unloaded): nothing else in this process uses it, and the font caches it maps would
-/// otherwise stay resident.
+/// unloaded), which is safe only because nothing else in this process uses it (neither ksni
+/// nor FreeType), no other thread calls it meanwhile (only the main loop does), and every
+/// pattern and configuration is destroyed first. Otherwise the font caches it maps would stay
+/// resident.
 fn font_file(family: &CStr) -> Option<(CString, c_long)> {
     const MATCH_PATTERN: c_int = 0; // FcMatchPattern
     const RESULT_MATCH: c_int = 0; // FcResultMatch
