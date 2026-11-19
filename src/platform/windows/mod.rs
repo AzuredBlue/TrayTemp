@@ -184,6 +184,7 @@ impl State {
         }
         *this = !*this;
         if *this {
+            self.app.set_sensor(k, open_sensor(k));
             let mut changes = self.app.tick();
             // The new icon is drawn from the fresh values below.
             changes.value[k.index()] = false;
@@ -192,6 +193,7 @@ impl State {
             self.apply(changes);
         } else {
             self.tray.remove(k);
+            self.app.set_sensor(k, None);
         }
     }
 
@@ -299,14 +301,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     0
 }
 
+/// Opens the sensor of `k`; it is dropped again when the kind is disabled.
+fn open_sensor(k: Kind) -> Option<Box<dyn Sensor>> {
+    match k {
+        Kind::Gpu => crate::sensor::d3dkmt::open_gpu_sensor(),
+        Kind::Cpu => PawnIoCpu::open().ok().map(|c| Box::new(c) as Box<dyn Sensor>),
+    }
+}
+
 pub fn run() {
     let settings = Settings::load();
-    let gpu = crate::sensor::d3dkmt::open_gpu_sensor();
-    let cpu: Option<Box<dyn Sensor>> = if settings.cpu_enabled {
-        PawnIoCpu::open().ok().map(|c| Box::new(c) as Box<dyn Sensor>)
-    } else {
-        None
-    };
+    let cpu = settings.cpu_enabled.then(|| open_sensor(Kind::Cpu)).flatten();
+    let gpu = settings.gpu_enabled.then(|| open_sensor(Kind::Gpu)).flatten();
     let mut app = App::new(settings, cpu, gpu);
 
     // SAFETY: standard window class and window creation; the class name and title are

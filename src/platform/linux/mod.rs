@@ -55,6 +55,7 @@ fn sync_prefs(app: &App, trays: &Trays) {
 fn sync_tray(app: &mut App, trays: &mut Trays, k: Kind, tx: &Sender<Action>) {
     let i = k.index();
     if app.enabled(k) && trays[i].is_none() {
+        app.set_sensor(k, open_sensor(k));
         let changes = app.tick();
         match spawn_tray(app, k, tx) {
             Ok(h) => trays[i] = Some(h),
@@ -64,6 +65,7 @@ fn sync_tray(app: &mut App, trays: &mut Trays, k: Kind, tx: &Sender<Action>) {
                     Kind::Cpu => app.settings.cpu_enabled = false,
                     Kind::Gpu => app.settings.gpu_enabled = false,
                 }
+                app.set_sensor(k, None);
             }
         }
         apply_changes(app, trays, changes);
@@ -71,6 +73,7 @@ fn sync_tray(app: &mut App, trays: &mut Trays, k: Kind, tx: &Sender<Action>) {
         if let Some(h) = trays[i].take() {
             h.shutdown().wait();
         }
+        app.set_sensor(k, None);
     }
 }
 
@@ -110,12 +113,21 @@ fn handle_action(app: &mut App, trays: &mut Trays, tx: &Sender<Action>, action: 
     true
 }
 
+/// Opens the sensor of `k`; it is dropped again when the kind is disabled.
+fn open_sensor(k: Kind) -> Option<Box<dyn Sensor>> {
+    let sys = Path::new("/sys");
+    match k {
+        Kind::Cpu => hwmon::find_cpu(sys).map(|s| Box::new(s) as Box<dyn Sensor>),
+        Kind::Gpu => hwmon::find_gpu(sys)
+            .map(|s| Box::new(s) as Box<dyn Sensor>)
+            .or_else(|| NvmlSensor::open().map(|s| Box::new(s) as Box<dyn Sensor>)),
+    }
+}
+
 pub fn run() {
     let settings = Settings::load();
-    let cpu = hwmon::find_cpu(Path::new("/sys")).map(|s| Box::new(s) as Box<dyn Sensor>);
-    let gpu = hwmon::find_gpu(Path::new("/sys"))
-        .map(|s| Box::new(s) as Box<dyn Sensor>)
-        .or_else(|| NvmlSensor::open().map(|s| Box::new(s) as Box<dyn Sensor>));
+    let cpu = settings.cpu_enabled.then(|| open_sensor(Kind::Cpu)).flatten();
+    let gpu = settings.gpu_enabled.then(|| open_sensor(Kind::Gpu)).flatten();
     let mut app = App::new(settings, cpu, gpu);
     let (tx, rx) = channel();
     let mut trays: Trays = [None, None];
