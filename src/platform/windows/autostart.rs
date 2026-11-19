@@ -17,7 +17,7 @@ use windows_sys::core::{GUID, PCWSTR};
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{
     SysAllocString, SysFreeString, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HWND,
-    LPARAM, MAX_PATH,
+    MAX_PATH,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
 use windows_sys::Win32::System::Com::{
@@ -31,7 +31,7 @@ use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_HIDE};
 
 use super::elevation::{is_elevated, run_elevated_and_wait, wide, Relaunch};
-use super::WM_AUTOSTART_ERROR;
+use super::{AUTOSTART_ERROR, WM_AUTOSTART_ERROR};
 use crate::sensor::pawnio::program_files;
 
 const TASK_NAME: &str = "TrayTemp";
@@ -55,8 +55,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Asks for autostart to be in the form `elevated_task` wants, or off when `enabled` is false.
 /// Returns at once; one worker applies them, and of requests that pile up the newest wins, so
-/// there are never two writers. A failure is posted to `hwnd` as `WM_AUTOSTART_ERROR`
-/// (lParam: a `Box<String>` the window takes over).
+/// there are never two writers. A failure is left in `AUTOSTART_ERROR` and `hwnd` gets
+/// `WM_AUTOSTART_ERROR`.
 pub fn request(hwnd: HWND, enabled: bool, elevated_task: bool) {
     // Setting the request and claiming the worker happen under one lock, and the worker
     // releases its claim under the same lock, so a request is never left without a worker.
@@ -85,13 +85,9 @@ fn worker() {
         };
         let Some(want) = want else { break };
         if let Err(e) = apply(want.enabled, want.elevated_task) {
-            let text = Box::into_raw(Box::new(e));
-            // SAFETY: plain post to the window; on success it takes the box, else we do.
-            unsafe {
-                if PostMessageW(want.hwnd as HWND, WM_AUTOSTART_ERROR, 0, text as LPARAM) == 0 {
-                    drop(Box::from_raw(text));
-                }
-            }
+            *AUTOSTART_ERROR.lock().unwrap() = Some(e);
+            // SAFETY: plain post to the window.
+            unsafe { PostMessageW(want.hwnd as HWND, WM_AUTOSTART_ERROR, 0, 0) };
         }
     }
     if com {

@@ -11,6 +11,7 @@ mod tray;
 use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use windows_sys::core::PCWSTR;
 use windows_sys::w;
@@ -52,14 +53,16 @@ const TIMER_ID: usize = 1;
 const WM_DISPLAY_STATE: u32 = WM_APP + 2;
 /// Posted to ourselves: the tray icon size, the UI font or the taskbar theme may have changed.
 const WM_RECHECK: u32 = WM_APP + 3;
-/// Posted by the autostart worker: lParam is a `Box<String>` (from `Box::into_raw`) with what
-/// went wrong; the window procedure takes it over.
+/// Posted by the autostart worker once it has put what went wrong in `AUTOSTART_ERROR`.
 const WM_AUTOSTART_ERROR: u32 = WM_APP + 4;
-/// Posted by a flow worker (see `run_flow`): lParam is a `Box<FlowDone>` (from `Box::into_raw`)
-/// that the window procedure takes over.
+/// Posted by a flow worker (see `run_flow`) once it has put its result in `FLOW_DONE`.
 const WM_FLOW_DONE: u32 = WM_APP + 5;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+// Worker results wait here, and the messages above carry nothing: any program of the same
+// user can post them to us, with any parameters.
+static AUTOSTART_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static FLOW_DONE: Mutex<Option<FlowDone>> = Mutex::new(None);
 
 const INSTALL_PROMPT: PCWSTR = w!("TrayTemp needs the PawnIO driver to read CPU temperature. It will be downloaded from github.com/namazso/PawnIO.Setup and installed now, which requires administrator permission.");
 const UNINSTALL_PROMPT: PCWSTR =
@@ -137,7 +140,10 @@ impl State {
 
     fn show_icon(&mut self, k: Kind) {
         if self.text.is_some() {
-            self.with_text(|t, app, look| t.redraw(app, look));
+            self.with_text(|t, app, look| {
+                t.set_tips(app);
+                t.redraw(app, look)
+            });
             return;
         }
         let canvas = render_value(self.app.shown(k), self.icon_size, self.font.as_mut(), self.style);
@@ -434,13 +440,9 @@ fn run_flow(hwnd: HWND, flow: impl FnOnce() -> FlowDone + Send + 'static) {
     BUSY.set(true);
     let hwnd = hwnd as isize;
     let spawned = std::thread::Builder::new().spawn(move || {
-        let done = Box::into_raw(Box::new(flow()));
-        // SAFETY: plain post; on success the window takes the box, else we do.
-        unsafe {
-            if PostMessageW(hwnd as HWND, WM_FLOW_DONE, 0, done as LPARAM) == 0 {
-                drop(Box::from_raw(done));
-            }
-        }
+        *FLOW_DONE.lock().unwrap() = Some(flow());
+        // SAFETY: plain post.
+        unsafe { PostMessageW(hwnd as HWND, WM_FLOW_DONE, 0, 0) };
     });
     if spawned.is_err() {
         BUSY.set(false);
@@ -497,13 +499,9 @@ fn on_flow_done(hwnd: HWND, done: FlowDone) {
     match applied {
         // The state is busy up the stack: handle the result again later.
         None => {
-            let again = Box::into_raw(Box::new(done.take().expect("not consumed")));
-            // SAFETY: plain post to our own window; on failure the box is ours again.
-            unsafe {
-                if PostMessageW(hwnd, WM_FLOW_DONE, 0, again as LPARAM) == 0 {
-                    drop(Box::from_raw(again));
-                }
-            }
+            *FLOW_DONE.lock().unwrap() = done;
+            // SAFETY: plain post to our own window.
+            unsafe { PostMessageW(hwnd, WM_FLOW_DONE, 0, 0) };
         }
         Some(None) => {
             BUSY.set(false);
@@ -707,15 +705,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { PostMessageW(hwnd, WM_RECHECK, full, 0) };
         }
         WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, |st| st.recheck(wp != 0)),
+        // Each slot is taken in a statement of its own, so the lock is free again before the
+        // handler, which may refill it or (with the message box) handle the next message.
         WM_FLOW_DONE => {
-            // SAFETY: posted by `run_flow` or `on_flow_done` with a `Box<FlowDone>` we now own.
-            let done = unsafe { Box::from_raw(lp as *mut FlowDone) };
-            on_flow_done(hwnd, *done);
+            let done = FLOW_DONE.lock().unwrap().take();
+            if let Some(done) = done {
+                on_flow_done(hwnd, done);
+            }
         }
         WM_AUTOSTART_ERROR => {
-            // SAFETY: posted by `autostart::request`'s worker with a `Box<String>` we now own.
-            let why = unsafe { Box::from_raw(lp as *mut String) };
-            error_box("Start with Windows could not be changed.", &why);
+            let why = AUTOSTART_ERROR.lock().unwrap().take();
+            if let Some(why) = why {
+                error_box("Start with Windows could not be changed.", &why);
+            }
         }
         WM_DESTROY => {
             if let Some(mut st) = STATE.take() {

@@ -16,6 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
 };
@@ -63,7 +64,8 @@ pub fn taskbar_style() -> TextStyle {
     }
 }
 
-/// The message font from the non-client metrics: Segoe UI unless the user changed it.
+/// The message font from the non-client metrics, sized for 96 DPI: Segoe UI unless the user
+/// changed it. (The plain call would size it for the system DPI, since we are DPI-aware.)
 pub fn ui_font() -> Option<LOGFONTW> {
     let mut ncm = NONCLIENTMETRICSW {
         cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
@@ -71,7 +73,7 @@ pub fn ui_font() -> Option<LOGFONTW> {
     };
     // SAFETY: `ncm` is a NONCLIENTMETRICSW with its size in cbSize, as the call requires.
     let ok = unsafe {
-        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, (&raw mut ncm).cast(), 0)
+        SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, ncm.cbSize, (&raw mut ncm).cast(), 0, 96)
     };
     (ok != 0).then_some(ncm.lfMessageFont)
 }

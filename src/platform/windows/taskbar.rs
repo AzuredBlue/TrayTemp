@@ -6,6 +6,7 @@
 
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Once;
 
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -26,7 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsWindow, LoadCursorW, PostMessageW, RegisterClassW, SendMessageW, SetWindowPos,
     UpdateLayeredWindow, CW_USEDEFAULT, HWND_TOP, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE,
     ULW_ALPHA, WM_CONTEXTMENU, WM_MOUSEACTIVATE, WM_RBUTTONUP, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use super::font;
@@ -46,7 +47,7 @@ const CLOCK_PAD: i32 = 12;
 /// A clock this wide (at 96 DPI) is assumed if the font can't be read.
 const CLOCK_FALLBACK: i32 = 62;
 
-/// What the font, colours and icon font look like right now.
+/// The label font and colours in use.
 pub struct Look<'a> {
     pub font: Option<&'a mut OsFont>,
     pub style: TextStyle,
@@ -73,6 +74,12 @@ pub struct TaskbarText {
     bars: Vec<Bar>,
     all: bool,
     icons: Option<OsFont>,
+    /// Whether `icons` was made for light text; it is made again when the taskbar theme flips.
+    icons_light: bool,
+}
+
+fn icon_font(light: bool) -> Option<OsFont> {
+    font::icon_font().map(|lf| OsFont::new(Box::new(font::GdiText::new(lf, light))))
 }
 
 fn rect_of(h: HWND) -> [i32; 4] {
@@ -126,8 +133,10 @@ fn create_bar(taskbar: HWND) -> Option<Bar> {
     // SAFETY: plain window creation; the class is registered and the strings are static.
     unsafe {
         let hinstance = GetModuleHandleW(null());
+        // NOPARENTNOTIFY: creating and destroying the strip then sends nothing to Explorer's
+        // thread, so a hung Explorer can't block ours.
         let win = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOPARENTNOTIFY,
             w!("TrayTempStrip"),
             null(),
             WS_CHILD | WS_VISIBLE,
@@ -256,8 +265,9 @@ impl TaskbarText {
     /// caller then shows tray icons instead.
     pub fn create(main: HWND, all: bool, app: &App, look: &mut Look) -> Option<TaskbarText> {
         MAIN.store(main as isize, Ordering::Relaxed);
-        // SAFETY: registers our strip class and loads the tooltip class; both are repeatable.
-        unsafe {
+        static CLASSES: Once = Once::new();
+        // SAFETY: registers our strip class and loads the tooltip class, once per process.
+        CLASSES.call_once(|| unsafe {
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
                 dwICC: ICC_WIN95_CLASSES,
@@ -271,12 +281,9 @@ impl TaskbarText {
                 ..Default::default()
             };
             RegisterClassW(&wc);
-        }
-        let mut t = TaskbarText {
-            bars: Vec::new(),
-            all,
-            icons: font::icon_font().map(|lf| OsFont::new(Box::new(font::GdiText::new(lf, font::is_light(look.style.fill))))),
-        };
+        });
+        let light = font::is_light(look.style.fill);
+        let mut t = TaskbarText { bars: Vec::new(), all, icons: icon_font(light), icons_light: light };
         t.relayout(all, app, look);
         // SAFETY: plain query.
         let main_taskbar = unsafe { FindWindowW(w!("Shell_TrayWnd"), null()) };
@@ -315,6 +322,12 @@ impl TaskbarText {
                 self.bars.extend(create_bar(prev));
             }
         }
+        self.set_tips(app);
+        self.redraw(app, look);
+    }
+
+    /// Sets every enabled sensor's tooltip text from the app.
+    pub fn set_tips(&self, app: &App) {
         for b in &self.bars {
             for k in [Kind::Cpu, Kind::Gpu] {
                 if app.enabled(k) {
@@ -322,12 +335,16 @@ impl TaskbarText {
                 }
             }
         }
-        self.redraw(app, look);
     }
 
     /// Draws every strip again from the app's values.
     pub fn redraw(&mut self, app: &App, look: &mut Look) {
         let value = |k| app.enabled(k).then(|| app.shown(k));
+        let light = font::is_light(look.style.fill);
+        if light != self.icons_light {
+            self.icons = icon_font(light);
+            self.icons_light = light;
+        }
         let (em, ui) = match font::ui_font() {
             Some(lf) => (lf.lfHeight.unsigned_abs().max(8), Some(lf)),
             None => (12, None),
