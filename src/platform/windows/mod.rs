@@ -13,10 +13,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::core::PCWSTR;
 use windows_sys::w;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::HPOWERNOTIFY;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForSystem, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
 };
@@ -432,6 +436,40 @@ fn has_arg(name: &str) -> bool {
     std::env::args_os().skip(1).any(|a| a == name)
 }
 
+/// Claims this session's single TrayTemp instance, so autostart plus a manual start can't show
+/// the icons twice. The mutex handle stays open until the process exits. False when another
+/// instance runs; one that runs elevated denies us access to its mutex, which counts too.
+/// An elevated relaunch starts while the instance that launched it is still exiting, so it
+/// waits up to 10 s for that one to go.
+fn claim_single_instance() -> bool {
+    let tries = if has_arg("--elevated") { 100 } else { 1 };
+    for i in 0..tries {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // SAFETY: a NUL-terminated name and no security attributes; the last error is read
+        // right after the call.
+        let (mutex, err) = unsafe {
+            let m = CreateMutexW(null(), 0, w!("Local\\TrayTemp.Instance"));
+            (m, GetLastError())
+        };
+        if mutex.is_null() {
+            if err == ERROR_ACCESS_DENIED {
+                continue;
+            }
+            // Anything else: run without the guard rather than not at all.
+            return true;
+        }
+        if err != ERROR_ALREADY_EXISTS {
+            return true;
+        }
+        // SAFETY: our own handle to the other instance's mutex, closed once so the object
+        // can go away when that instance exits.
+        unsafe { CloseHandle(mutex) };
+    }
+    false
+}
+
 /// The one place the CPU sensor is opened (startup, enabling CPU, retrying the driver).
 /// Relaunches elevated or installs the PawnIO driver when that is what's missing.
 /// `None`: an elevated instance was started and this one should exit.
@@ -550,6 +588,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 pub fn run() {
+    if !claim_single_instance() {
+        return;
+    }
     let mut settings = Settings::load();
     // Sensors are opened only while their kind is enabled, and dropped when it is disabled.
     let mut cpu = None;

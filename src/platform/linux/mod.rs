@@ -2,7 +2,8 @@ mod autostart;
 mod font;
 mod tray;
 
-use std::path::Path;
+use std::fs::{File, TryLockError};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -147,7 +148,33 @@ fn open_sensor(k: Kind) -> Option<Box<dyn Sensor>> {
     }
 }
 
+/// Claims this user's single TrayTemp instance, so autostart plus a manual start can't show the
+/// icons twice: a lock on a file in the runtime folder (else the settings folder), released when
+/// the process exits. `Err` when another instance holds it; `Ok(None)` when no lock file can be
+/// made, and TrayTemp runs without the guard.
+fn claim_single_instance() -> Result<Option<File>, ()> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Settings::path()?.parent().map(Path::to_path_buf));
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = File::create(dir.join("traytemp.lock")) else {
+        return Ok(None);
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(()),
+        Err(TryLockError::Error(_)) => Ok(None),
+    }
+}
+
 pub fn run() {
+    // Held until `run` returns, which is when the process ends.
+    let Ok(_instance) = claim_single_instance() else {
+        return;
+    };
     let settings = Settings::load();
     let cpu = settings.cpu_enabled.then(|| open_sensor(Kind::Cpu)).flatten();
     let gpu = settings.gpu_enabled.then(|| open_sensor(Kind::Gpu)).flatten();
