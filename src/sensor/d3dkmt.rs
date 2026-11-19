@@ -33,7 +33,7 @@ fn close(adapter: u32) {
 }
 
 /// Queries a fixed-size struct. False when the NTSTATUS is not success.
-fn query<T: Default>(adapter: u32, kind: KMTQUERYADAPTERINFOTYPE, data: &mut T) -> bool {
+fn query<T>(adapter: u32, kind: KMTQUERYADAPTERINFOTYPE, data: &mut T) -> bool {
     let mut q = D3DKMT_QUERYADAPTERINFO {
         hAdapter: adapter,
         Type: kind,
@@ -56,8 +56,10 @@ impl Sensor for D3dkmtSensor {
     fn read(&mut self) -> Reading {
         // Unverified: whether this query wakes a sleeping hybrid-laptop dGPU. If it does,
         // a non-waking power-state check (returning `Reading::Asleep`) belongs right here.
+        // A successful query reporting 0 means the GPU is in a low-power state: Asleep.
         match read_temp(self.adapter) {
             Some(t) if valid_temp(t) => Reading::Temp(t),
+            Some(0.0) => Reading::Asleep,
             _ => Reading::Unavailable,
         }
     }
@@ -72,8 +74,8 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn key(&self) -> (bool, bool, u64) {
-        (self.has_temp, self.discrete, self.dedicated)
+    fn key(&self) -> (bool, u64, bool) {
+        (self.discrete, self.dedicated, self.has_temp)
     }
 }
 
@@ -93,15 +95,16 @@ fn enum_adapters() -> Vec<D3DKMT_ADAPTERINFO> {
     list
 }
 
-/// Picks the best adapter. Returns the sensor if it has a valid temperature, otherwise
-/// whether the best adapter is an NVIDIA one (for the NVML fallback).
-fn pick() -> Result<D3dkmtSensor, bool> {
+/// Picks the best non-software adapter: discrete first (HybridDiscrete, then larger
+/// dedicated VRAM), then one with a valid temperature. Returns it with its vendor ID and
+/// whether it had a valid temperature at startup.
+fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
     let mut best: Option<Candidate> = None;
     for info in enum_adapters() {
         let h = info.hAdapter;
         let mut ty = D3DKMT_ADAPTERTYPE::default();
-        // SAFETY: reading the plain-integer view of the union.
         let flags = if query(h, KMTQAITYPE_ADAPTERTYPE, &mut ty) {
+            // SAFETY: reading the plain-integer view of the union.
             unsafe { ty.Anonymous.Value }
         } else {
             0
@@ -139,21 +142,17 @@ fn pick() -> Result<D3dkmtSensor, bool> {
             }
         }
     }
-    match best {
-        Some(b) if b.has_temp => Ok(D3dkmtSensor { adapter: b.adapter }),
-        Some(b) => {
-            close(b.adapter);
-            Err(b.vendor == VENDOR_NVIDIA)
-        }
-        None => Err(false),
-    }
+    best.map(|b| (D3dkmtSensor { adapter: b.adapter }, b.vendor, b.has_temp))
 }
 
-/// D3DKMT if the chosen adapter returns a valid temperature, else NVML for NVIDIA, else None.
+/// D3DKMT on the preferred adapter. If it has no valid temperature at startup and is
+/// NVIDIA, NVML when available; otherwise D3DKMT is kept so it recovers when the GPU wakes.
 pub fn open_gpu_sensor() -> Option<Box<dyn Sensor>> {
-    match pick() {
-        Ok(s) => Some(Box::new(s)),
-        Err(true) => NvmlSensor::open().map(|s| Box::new(s) as Box<dyn Sensor>),
-        Err(false) => None,
+    let (sensor, vendor, has_temp) = pick()?;
+    if !has_temp && vendor == VENDOR_NVIDIA {
+        if let Some(n) = NvmlSensor::open() {
+            return Some(Box::new(n));
+        }
     }
+    Some(Box::new(sensor))
 }
