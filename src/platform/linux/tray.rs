@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, ToolTip, Tray};
 
-use crate::render::{render_value, OUTLINED};
+use crate::render::{render_value, Canvas, OsFont, TextStyle};
 use crate::sensor::Kind;
 use crate::settings::Settings;
 
@@ -40,7 +40,8 @@ impl Prefs {
 
 pub struct SensorTray {
     pub kind: Kind,
-    pub value: Option<i32>,
+    /// The number at every size, drawn by the main loop: callbacks run on the tray's thread.
+    pub icons: Vec<Icon>,
     pub tip_title: String,
     pub tip_desc: String,
     pub prefs: Prefs,
@@ -57,8 +58,14 @@ impl SensorTray {
     }
 }
 
-fn icon(value: Option<i32>, size: u32) -> Icon {
-    let canvas = render_value(value, size, None, OUTLINED);
+/// The number as pixmaps for the panel: 22 px is its icon size, 44 px the same at 2x scale.
+pub fn icons(value: Option<i32>, mut font: Option<&mut OsFont>, style: TextStyle) -> Vec<Icon> {
+    [22, 32, 44]
+        .map(|size| icon(render_value(value, size, font.as_deref_mut(), style)))
+        .into()
+}
+
+fn icon(canvas: Canvas) -> Icon {
     let mut data = Vec::with_capacity(canvas.px.len() * 4);
     for p in &canvas.px {
         data.extend_from_slice(&p.to_be_bytes());
@@ -93,7 +100,7 @@ impl Tray for SensorTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        vec![icon(self.value, 22), icon(self.value, 32)]
+        self.icons.clone()
     }
 
     fn tool_tip(&self) -> ToolTip {

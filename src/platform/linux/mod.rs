@@ -1,4 +1,5 @@
 mod autostart;
+mod font;
 mod tray;
 
 use std::path::Path;
@@ -10,16 +11,22 @@ use ksni::blocking::{Handle, TrayMethods};
 use crate::app::{App, Changes};
 use crate::sensor::{hwmon, nvml::NvmlSensor, Kind, Sensor};
 use crate::settings::Settings;
+use font::DesktopText;
 use tray::{Action, Prefs, SensorTray};
 
 type Trays = [Option<Handle<SensorTray>>; 2];
 
 const KINDS: [Kind; 2] = [Kind::Cpu, Kind::Gpu];
 
-fn spawn_tray(app: &App, k: Kind, tx: &Sender<Action>) -> Result<Handle<SensorTray>, ksni::Error> {
+fn spawn_tray(
+    app: &App,
+    text: &mut DesktopText,
+    k: Kind,
+    tx: &Sender<Action>,
+) -> Result<Handle<SensorTray>, ksni::Error> {
     let mut tray = SensorTray {
         kind: k,
-        value: app.shown(k),
+        icons: tray::icons(app.shown(k), text.font.as_mut(), text.style),
         tip_title: String::new(),
         tip_desc: String::new(),
         prefs: Prefs::from_settings(&app.settings),
@@ -29,15 +36,19 @@ fn spawn_tray(app: &App, k: Kind, tx: &Sender<Action>) -> Result<Handle<SensorTr
     tray.spawn()
 }
 
-fn apply_changes(app: &App, trays: &Trays, changes: Changes) {
+fn apply_changes(app: &App, trays: &Trays, text: &mut DesktopText, changes: Changes) {
     for k in KINDS {
         let i = k.index();
         if !(changes.value[i] || changes.tooltip[i]) {
             continue;
         }
         if let Some(h) = &trays[i] {
+            let icons =
+                changes.value[i].then(|| tray::icons(app.shown(k), text.font.as_mut(), text.style));
             h.update(|t| {
-                t.value = app.shown(k);
+                if let Some(icons) = icons {
+                    t.icons = icons;
+                }
                 t.set_tip(app.tooltip(k));
             });
         }
@@ -52,12 +63,18 @@ fn sync_prefs(app: &App, trays: &Trays) {
 }
 
 /// Starts or stops the tray of `k` to match its enabled setting.
-fn sync_tray(app: &mut App, trays: &mut Trays, k: Kind, tx: &Sender<Action>) {
+fn sync_tray(
+    app: &mut App,
+    trays: &mut Trays,
+    text: &mut DesktopText,
+    k: Kind,
+    tx: &Sender<Action>,
+) {
     let i = k.index();
     if app.enabled(k) && trays[i].is_none() {
         app.set_sensor(k, open_sensor(k));
         let changes = app.tick();
-        match spawn_tray(app, k, tx) {
+        match spawn_tray(app, text, k, tx) {
             Ok(h) => trays[i] = Some(h),
             Err(e) => {
                 eprintln!("traytemp: cannot show the {} tray icon: {e}", k.label());
@@ -68,7 +85,7 @@ fn sync_tray(app: &mut App, trays: &mut Trays, k: Kind, tx: &Sender<Action>) {
                 app.set_sensor(k, None);
             }
         }
-        apply_changes(app, trays, changes);
+        apply_changes(app, trays, text, changes);
     } else if !app.enabled(k) {
         if let Some(h) = trays[i].take() {
             h.shutdown().wait();
@@ -84,19 +101,25 @@ fn save(settings: &Settings) {
 }
 
 /// Applies a menu action. Returns false when the app should exit.
-fn handle_action(app: &mut App, trays: &mut Trays, tx: &Sender<Action>, action: Action) -> bool {
+fn handle_action(
+    app: &mut App,
+    trays: &mut Trays,
+    text: &mut DesktopText,
+    tx: &Sender<Action>,
+    action: Action,
+) -> bool {
     match action {
         Action::Exit => return false,
         Action::ToggleCpu => {
             if !app.settings.cpu_enabled || app.settings.gpu_enabled {
                 app.settings.cpu_enabled = !app.settings.cpu_enabled;
-                sync_tray(app, trays, Kind::Cpu, tx);
+                sync_tray(app, trays, text, Kind::Cpu, tx);
             }
         }
         Action::ToggleGpu => {
             if !app.settings.gpu_enabled || app.settings.cpu_enabled {
                 app.settings.gpu_enabled = !app.settings.gpu_enabled;
-                sync_tray(app, trays, Kind::Gpu, tx);
+                sync_tray(app, trays, text, Kind::Gpu, tx);
             }
         }
         Action::SetInterval(s) => app.settings.interval_s = s,
@@ -129,13 +152,14 @@ pub fn run() {
     let cpu = settings.cpu_enabled.then(|| open_sensor(Kind::Cpu)).flatten();
     let gpu = settings.gpu_enabled.then(|| open_sensor(Kind::Gpu)).flatten();
     let mut app = App::new(settings, cpu, gpu);
+    let mut text = DesktopText::load();
     let (tx, rx) = channel();
     let mut trays: Trays = [None, None];
 
     app.tick();
     for k in KINDS {
         if app.enabled(k) {
-            match spawn_tray(&app, k, &tx) {
+            match spawn_tray(&app, &mut text, k, &tx) {
                 Ok(h) => trays[k.index()] = Some(h),
                 Err(e) => {
                     eprintln!("traytemp: cannot create the {} tray icon: {e}", k.label());
@@ -154,15 +178,19 @@ pub fn run() {
         let wait = (last_tick + interval).saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(action) => {
-                if !handle_action(&mut app, &mut trays, &tx, action) {
+                if !handle_action(&mut app, &mut trays, &mut text, &tx, action) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 last_tick = Instant::now();
-                let changes = app.tick();
+                let mut changes = app.tick();
+                // A new desktop font or text colour redraws both numbers.
+                if text.refresh() {
+                    changes.value = [true, true];
+                }
                 if changes.any() {
-                    apply_changes(&app, &trays, changes);
+                    apply_changes(&app, &trays, &mut text, changes);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
