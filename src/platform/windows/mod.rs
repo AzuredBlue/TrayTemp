@@ -1,3 +1,4 @@
+mod font;
 mod icon;
 mod menu;
 mod power;
@@ -24,18 +25,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app::{App, Changes};
-use crate::render::render_value;
+use crate::render::{render_value, OsFont, TextStyle};
 use crate::sensor::pawnio::PawnIoCpu;
 use crate::sensor::{Kind, Sensor};
 use crate::settings::{DisplayMode, Settings};
+use font::GdiText;
 use tray::{TrayIcons, WM_TRAY};
 
 const KINDS: [Kind; 2] = [Kind::Cpu, Kind::Gpu];
 const TIMER_ID: usize = 1;
 /// Posted to ourselves: wParam is 1 when the display came on, 0 when it went off.
 const WM_DISPLAY_STATE: u32 = WM_APP + 2;
-/// Posted to ourselves: the tray icon size may have changed.
-const WM_RECHECK_SIZE: u32 = WM_APP + 3;
+/// Posted to ourselves: the tray icon size, the UI font or the taskbar theme may have changed.
+const WM_RECHECK: u32 = WM_APP + 3;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -44,6 +46,10 @@ struct State {
     app: App,
     tray: TrayIcons,
     icon_size: u32,
+    /// Face of the UI font in use, to notice when the user changes it.
+    face: Option<[u16; 32]>,
+    font: Option<OsFont>,
+    style: TextStyle,
     display_on: bool,
     power: HPOWERNOTIFY,
 }
@@ -86,7 +92,7 @@ fn icon_size() -> u32 {
 
 impl State {
     fn show_icon(&mut self, k: Kind) {
-        let canvas = render_value(self.app.shown(k), self.icon_size);
+        let canvas = render_value(self.app.shown(k), self.icon_size, self.font.as_mut(), self.style);
         self.tray.add(k, &canvas, self.app.tooltip(k));
     }
 
@@ -97,7 +103,8 @@ impl State {
             if !self.app.enabled(k) || !(changes.value[i] || changes.tooltip[i]) {
                 continue;
             }
-            let canvas = changes.value[i].then(|| render_value(self.app.shown(k), self.icon_size));
+            let canvas = changes.value[i]
+                .then(|| render_value(self.app.shown(k), self.icon_size, self.font.as_mut(), self.style));
             let tip = changes.tooltip[i].then(|| self.app.tooltip(k));
             self.tray.update(k, canvas.as_ref(), tip);
         }
@@ -136,15 +143,31 @@ impl State {
         }
     }
 
-    fn recheck_size(&mut self) {
+    /// Reads the UI font again; true if its face changed.
+    fn reload_font(&mut self) -> bool {
+        let lf = font::ui_font();
+        let face = lf.map(|f| f.lfFaceName);
+        if face == self.face {
+            return false;
+        }
+        self.face = face;
+        self.font = lf.map(|f| OsFont::new(Box::new(GdiText::new(f))));
+        true
+    }
+
+    /// Redraws the icons if the icon size, the UI font or the taskbar theme changed.
+    fn recheck(&mut self) {
         let size = icon_size();
-        if size == self.icon_size {
+        let style = font::taskbar_style();
+        let font_changed = self.reload_font();
+        if size == self.icon_size && style == self.style && !font_changed {
             return;
         }
         self.icon_size = size;
+        self.style = style;
         for k in KINDS {
             if self.app.enabled(k) {
-                let canvas = render_value(self.app.shown(k), size);
+                let canvas = render_value(self.app.shown(k), size, self.font.as_mut(), self.style);
                 self.tray.update(k, Some(&canvas), None);
             }
         }
@@ -254,9 +277,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DISPLAY_STATE => run_or_repost(hwnd, msg, wp, lp, |st| st.set_display(wp != 0)),
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             // SAFETY: plain post to our own window.
-            unsafe { PostMessageW(hwnd, WM_RECHECK_SIZE, 0, 0) };
+            unsafe { PostMessageW(hwnd, WM_RECHECK, 0, 0) };
         }
-        WM_RECHECK_SIZE => run_or_repost(hwnd, msg, wp, lp, State::recheck_size),
+        WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, State::recheck),
         WM_DESTROY => {
             if let Some(mut st) = STATE.take() {
                 st.shutdown();
@@ -267,7 +290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             run_or_repost(hwnd, msg, wp, lp, |st| {
                 st.tray.readd_all();
-                st.recheck_size();
+                st.recheck();
             });
         }
         // SAFETY: default handling for everything else.
@@ -330,9 +353,13 @@ pub fn run() {
         app,
         tray: TrayIcons::new(hwnd),
         icon_size: icon_size(),
+        face: None,
+        font: None,
+        style: font::taskbar_style(),
         display_on: true,
         power: 0,
     };
+    st.reload_font();
     for k in KINDS {
         if st.app.enabled(k) {
             st.show_icon(k);

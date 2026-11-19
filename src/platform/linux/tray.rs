@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, ToolTip, Tray};
 
-use crate::render::render_value;
+use crate::render::{render_value, OUTLINED};
 use crate::sensor::Kind;
 use crate::settings::Settings;
 
@@ -58,7 +58,7 @@ impl SensorTray {
 }
 
 fn icon(value: Option<i32>, size: u32) -> Icon {
-    let canvas = render_value(value, size);
+    let canvas = render_value(value, size, None, OUTLINED);
     let mut data = Vec::with_capacity(canvas.px.len() * 4);
     for p in &canvas.px {
         data.extend_from_slice(&p.to_be_bytes());
