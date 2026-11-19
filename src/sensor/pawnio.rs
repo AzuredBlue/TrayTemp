@@ -76,9 +76,14 @@ pub fn cpu_vendor() -> Vendor {
     }
 }
 
-/// `%ProgramFiles%\PawnIO`, with the folder taken from the shell, not the environment:
-/// the app may run elevated and a per-user variable could redirect it.
+/// `%ProgramFiles%\PawnIO`.
 pub fn install_dir() -> Option<PathBuf> {
+    Some(program_files()?.join("PawnIO"))
+}
+
+/// `%ProgramFiles%`, taken from the shell, not the environment: the app may run elevated and
+/// a per-user variable could redirect it.
+pub fn program_files() -> Option<PathBuf> {
     let mut p: *mut u16 = null_mut();
     // SAFETY: on success `p` receives a NUL-terminated string that we free below.
     let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, null_mut(), &mut p) };
@@ -95,7 +100,7 @@ pub fn install_dir() -> Option<PathBuf> {
         CoTaskMemFree(p as *const c_void);
         s
     };
-    Some(PathBuf::from(dir).join("PawnIO"))
+    Some(PathBuf::from(dir))
 }
 
 fn lib_path() -> Option<PathBuf> {

@@ -21,44 +21,22 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
 use windows_sys::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_HIDE};
 
 use super::elevation::{is_elevated, run_elevated_and_wait, wide, Relaunch};
 use super::WM_AUTOSTART_ERROR;
+use crate::sensor::pawnio::program_files;
 
 const TASK_NAME: &str = "TrayTemp";
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("TrayTemp");
-
-/// `<Program Files>`, taken from the shell, not the environment: the app may run elevated and
-/// a per-user variable could redirect it.
-fn program_files() -> Option<PathBuf> {
-    let mut p: *mut u16 = null_mut();
-    // SAFETY: on success `p` receives a NUL-terminated string that we free below.
-    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, null_mut(), &mut p) };
-    if hr < 0 || p.is_null() {
-        return None;
-    }
-    // SAFETY: `p` is a valid NUL-terminated UTF-16 string until CoTaskMemFree.
-    let dir = unsafe {
-        let mut n = 0;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        let s = OsString::from_wide(std::slice::from_raw_parts(p, n));
-        CoTaskMemFree(p as *const c_void);
-        s
-    };
-    Some(PathBuf::from(dir))
-}
 
 /// `<Program Files>\TrayTemp\traytemp.exe`.
 fn program_files_exe() -> Option<PathBuf> {
@@ -251,6 +229,10 @@ struct Base {
 struct Variant([u64; 3]);
 
 const EMPTY: Variant = Variant([0; 3]);
+
+// The vtable signatures pass VARIANT by value with its 64-bit layout; a 32-bit build would
+// need a different one.
+const _: () = assert!(size_of::<Variant>() == 24 && size_of::<usize>() == 8);
 
 #[repr(C)]
 struct ServiceVtbl {
@@ -486,10 +468,16 @@ fn sync_copy(dest: &Path, dir: &Path) -> Result<(), String> {
     if identical() == Some(true) {
         return Ok(());
     }
+    // Copied under a temporary name and then renamed over the old copy, so the task never
+    // points at a half-written exe, even if TrayTemp exits during the copy.
+    let part = dest.with_extension("exe.part");
     std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::copy(&exe, dest))
-        .map(drop)
-        .map_err(|e| format!("TrayTemp could not be copied to Program Files: {e}"))
+        .and_then(|()| std::fs::copy(&exe, &part))
+        .and_then(|_| std::fs::rename(&part, dest))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            format!("TrayTemp could not be copied to Program Files: {e}")
+        })
 }
 
 /// Removes the Program Files copy and its folder, for an elevated process once the task that
