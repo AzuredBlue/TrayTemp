@@ -92,9 +92,11 @@ impl App {
         }
     }
 
-    /// Replaces the sensor, e.g. after the CPU driver is installed. Stats are kept.
+    /// Replaces the sensor, e.g. after the CPU driver is installed. Stats are kept; the shown
+    /// value is cleared until the new sensor reads one.
     pub fn set_sensor(&mut self, k: Kind, s: Option<Box<dyn Sensor>>) {
         self.sensors[k.index()] = s;
+        self.shown[k.index()] = None;
     }
 }
 

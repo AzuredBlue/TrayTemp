@@ -76,9 +76,9 @@ pub fn cpu_vendor() -> Vendor {
     }
 }
 
-/// `%ProgramFiles%\PawnIO\PawnIOLib.dll`, with the folder taken from the shell, not the
-/// environment: the app may run elevated and a per-user variable could redirect it.
-fn lib_path() -> Option<PathBuf> {
+/// `%ProgramFiles%\PawnIO`, with the folder taken from the shell, not the environment:
+/// the app may run elevated and a per-user variable could redirect it.
+pub fn install_dir() -> Option<PathBuf> {
     let mut p: *mut u16 = null_mut();
     // SAFETY: on success `p` receives a NUL-terminated string that we free below.
     let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, null_mut(), &mut p) };
@@ -95,7 +95,16 @@ fn lib_path() -> Option<PathBuf> {
         CoTaskMemFree(p as *const c_void);
         s
     };
-    Some(PathBuf::from(dir).join("PawnIO").join("PawnIOLib.dll"))
+    Some(PathBuf::from(dir).join("PawnIO"))
+}
+
+fn lib_path() -> Option<PathBuf> {
+    Some(install_dir()?.join("PawnIOLib.dll"))
+}
+
+/// True when PawnIOLib.dll exists, whether or not it loads.
+pub fn lib_present() -> bool {
+    lib_path().is_some_and(|p| p.is_file())
 }
 
 fn load_lib() -> Result<Library, PawnIoError> {

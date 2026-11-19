@@ -1,6 +1,8 @@
+mod elevation;
 mod font;
 mod icon;
 mod menu;
+mod pawnio_setup;
 mod power;
 mod tray;
 
@@ -8,6 +10,7 @@ use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use windows_sys::core::PCWSTR;
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
@@ -18,17 +21,21 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetTimer, MSG, MSGFLT_ALLOW, PBT_POWERSETTINGCHANGE, SM_CXSMICON, WM_APP,
-    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetMessageW, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SetForegroundWindow, SetTimer, IDOK, IDYES, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND, MB_YESNO,
+    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, MSGFLT_ALLOW, PBT_POWERSETTINGCHANGE, SM_CXSMICON,
+    WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL,
+    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::app::{App, Changes};
 use crate::render::{render_value, OsFont, TextStyle};
-use crate::sensor::pawnio::PawnIoCpu;
+use crate::sensor::d3dkmt::open_gpu_sensor;
+use crate::sensor::pawnio::{self, PawnIoCpu, PawnIoError};
 use crate::sensor::{Kind, Sensor};
 use crate::settings::{DisplayMode, Settings};
+use elevation::{is_elevated, wide, Relaunch};
 use font::GdiText;
 use tray::{TrayIcons, WM_TRAY};
 
@@ -41,6 +48,10 @@ const WM_RECHECK: u32 = WM_APP + 3;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
+const INSTALL_PROMPT: PCWSTR = w!("TrayTemp needs the PawnIO driver to read CPU temperature. It will be downloaded from github.com/namazso/PawnIO.Setup and installed now, which requires administrator permission.");
+const UNINSTALL_PROMPT: PCWSTR =
+    w!("Also uninstall the CPU temperature driver (PawnIO)? Other apps may use it.");
+
 struct State {
     hwnd: HWND,
     app: App,
@@ -52,15 +63,24 @@ struct State {
     style: TextStyle,
     display_on: bool,
     power: HPOWERNOTIFY,
+    /// CPU is enabled but its driver is missing or unusable, or TrayTemp isn't elevated.
+    /// The menu then offers to retry.
+    cpu_driver_failed: bool,
 }
 
 thread_local! {
     // Moved out while a handler runs: a message that re-enters the window procedure
     // (Shell_NotifyIconW can dispatch sent messages) finds it empty instead of aliasing it.
     static STATE: Cell<Option<State>> = const { Cell::new(None) };
+    /// Set while a CPU driver step shows a dialog, the UAC prompt or waits for an installer,
+    /// so the menu can't open again and start a second one.
+    static BUSY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Runs `f` on the state; `None` if a handler further up the stack has it.
+/// Never show a dialog or the UAC prompt, or wait for a process, inside `f`: their modal loops
+/// dispatch messages, which would find the state taken and repost themselves at 100 % CPU.
+/// Return what is left to do and run it after, as `on_tray` does with `FollowUp`.
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let mut st = STATE.take()?;
     let r = f(&mut st);
@@ -175,50 +195,76 @@ impl State {
         }
     }
 
-    fn toggle(&mut self, k: Kind) {
+    fn toggle(&mut self, k: Kind) -> FollowUp {
         let s = &mut self.app.settings;
         let (this, other) = match k {
             Kind::Cpu => (&mut s.cpu_enabled, s.gpu_enabled),
             Kind::Gpu => (&mut s.gpu_enabled, s.cpu_enabled),
         };
         if *this && !other {
-            return;
+            return FollowUp::None;
         }
         *this = !*this;
-        if *this {
-            self.app.set_sensor(k, open_sensor(k));
+        if !*this {
+            self.tray.remove(k);
+            self.app.set_sensor(k, None);
+            if k == Kind::Cpu {
+                self.cpu_driver_failed = false;
+                return FollowUp::CpuDisabled;
+            }
+        } else if k == Kind::Cpu {
+            // Shows "--" until `start_cpu`, which may need dialogs or a relaunch, has run.
+            self.show_icon(k);
+            return FollowUp::StartCpu;
+        } else {
+            self.app.set_sensor(k, open_gpu_sensor());
             let mut changes = self.app.tick();
             // The new icon is drawn from the fresh values below.
             changes.value[k.index()] = false;
             changes.tooltip[k.index()] = false;
             self.show_icon(k);
             self.apply(changes);
-        } else {
-            self.tray.remove(k);
-            self.app.set_sensor(k, None);
         }
+        FollowUp::None
     }
 
-    /// Applies a menu command. Returns false to exit.
-    fn command(&mut self, id: u32) -> bool {
-        match id {
-            menu::ID_EXIT => return false,
-            menu::ID_MODE_ICONS => self.app.settings.display_mode = DisplayMode::TrayIcons,
+    /// Takes the outcome of `start_cpu` run for a menu command; the CPU icon is shown.
+    fn cpu_started(&mut self, start: CpuStart) {
+        if start.installed {
+            self.app.settings.pawnio_installed_by_traytemp = true;
+            let _ = self.app.settings.save();
+        }
+        self.cpu_driver_failed = start.failed;
+        self.app.set_sensor(Kind::Cpu, start.sensor);
+        self.tick();
+    }
+
+    /// Applies a menu command; returns what is left to do once the state is released.
+    fn command(&mut self, id: u32) -> FollowUp {
+        let follow = match id {
+            menu::ID_EXIT => return FollowUp::Exit,
+            menu::ID_MODE_ICONS => {
+                self.app.settings.display_mode = DisplayMode::TrayIcons;
+                FollowUp::None
+            }
             menu::ID_CPU => self.toggle(Kind::Cpu),
             menu::ID_GPU => self.toggle(Kind::Gpu),
+            menu::ID_RETRY_DRIVER if self.cpu_driver_failed => FollowUp::StartCpu,
             _ => match menu::interval_for(id) {
                 Some(s) => {
                     self.app.settings.interval_s = s;
                     if self.display_on {
                         self.start_timer();
                     }
+                    FollowUp::None
                 }
-                None => return true,
+                None => return FollowUp::None,
             },
-        }
+        };
         // There is no console to report to; the menu keeps working without a saved file.
+        // Saved before any relaunch, so the elevated instance starts from these settings.
         let _ = self.app.settings.save();
-        true
+        follow
     }
 
     fn shutdown(&mut self) {
@@ -233,12 +279,14 @@ impl State {
 
 fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     // Version 4: LOWORD(lParam) is the event, wParam holds the anchor point.
-    if (lp & 0xFFFF) as u32 != WM_CONTEXTMENU {
+    if (lp & 0xFFFF) as u32 != WM_CONTEXTMENU || BUSY.get() {
         return;
     }
     // Copy what the menu needs and release the state: the menu's modal loop dispatches
     // messages (timer ticks keep running while it is open).
-    let Some(settings) = with_state(|st| st.app.settings.clone()) else {
+    let Some((settings, cpu_driver_failed)) =
+        with_state(|st| (st.app.settings.clone(), st.cpu_driver_failed))
+    else {
         // SAFETY: plain post to our own window.
         unsafe { PostMessageW(hwnd, WM_TRAY, wp, lp) };
         return;
@@ -249,16 +297,185 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     // menu closes when the user clicks elsewhere.
     let cmd = unsafe {
         SetForegroundWindow(hwnd);
-        let cmd = menu::show(hwnd, &settings, false, x, y);
+        let cmd = menu::show(hwnd, &settings, cpu_driver_failed, x, y);
         PostMessageW(hwnd, WM_NULL, 0, 0);
         cmd
     };
-    if let Some(id) = cmd {
-        if with_state(|st| st.command(id)) == Some(false) {
-            // SAFETY: the state is back in place, so WM_DESTROY can clean it up.
-            unsafe { DestroyWindow(hwnd) };
-        }
+    if let Some(follow) = cmd.and_then(|id| with_state(|st| st.command(id))) {
+        follow_up(hwnd, follow);
     }
+}
+
+/// What a menu command leaves to do once the state is released.
+enum FollowUp {
+    None,
+    Exit,
+    /// CPU was enabled, or the driver install is retried.
+    StartCpu,
+    CpuDisabled,
+}
+
+/// Runs what a menu command left to do, with the state released: the dialogs, the UAC
+/// prompt and the waits for PawnIO's installer and uninstaller all happen here.
+fn follow_up(hwnd: HWND, follow: FollowUp) {
+    BUSY.set(true);
+    let exit = match follow {
+        FollowUp::None => false,
+        FollowUp::Exit => true,
+        FollowUp::StartCpu => match start_cpu(false) {
+            None => true,
+            Some(start) => {
+                if let Some(s) = with_state(|st| {
+                    st.cpu_started(start);
+                    st.app.settings.clone()
+                }) {
+                    elevation_need_changed(&s);
+                }
+                false
+            }
+        },
+        FollowUp::CpuDisabled => {
+            offer_uninstall();
+            if let Some(s) = with_state(|st| st.app.settings.clone()) {
+                elevation_need_changed(&s);
+            }
+            false
+        }
+    };
+    BUSY.set(false);
+    if exit {
+        // SAFETY: the state is back in place, so WM_DESTROY can clean it up.
+        unsafe { DestroyWindow(hwnd) };
+    }
+}
+
+/// After CPU was disabled: if TrayTemp installed PawnIO, offers to uninstall it.
+fn offer_uninstall() {
+    let ours = with_state(|st| st.app.settings.pawnio_installed_by_traytemp) == Some(true);
+    if !ours || message_box(UNINSTALL_PROMPT, MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return;
+    }
+    match pawnio_setup::uninstall() {
+        Ok(()) => {
+            with_state(|st| {
+                st.app.settings.pawnio_installed_by_traytemp = false;
+                let _ = st.app.settings.save();
+            });
+        }
+        Err(e) => error_box("The CPU temperature driver could not be uninstalled.", &e),
+    }
+}
+
+/// Hook for when enabling or disabling CPU changed whether TrayTemp needs to run elevated:
+/// autostart switches between its elevated and its plain form here. Called with the state
+/// released, so it may wait for other programs. Not wired up yet.
+fn elevation_need_changed(_settings: &Settings) {}
+
+/// A TrayTemp message box, brought to the foreground. Runs a modal loop: never call it inside
+/// `with_state`.
+fn message_box(text: PCWSTR, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window, so the
+    // box gets its own taskbar button.
+    unsafe { MessageBoxW(null_mut(), text, w!("TrayTemp"), style | MB_SETFOREGROUND) }
+}
+
+fn error_box(what: &str, why: &str) {
+    let text = wide(format!("{what}\n\n{why}"));
+    message_box(text.as_ptr(), MB_ICONERROR);
+}
+
+/// What starting CPU temperature came to.
+struct CpuStart {
+    sensor: Option<Box<dyn Sensor>>,
+    /// The driver is missing or unusable, or TrayTemp isn't elevated: CPU shows "--" and
+    /// the menu offers to retry.
+    failed: bool,
+    /// TrayTemp installed PawnIO just now.
+    installed: bool,
+}
+
+impl CpuStart {
+    fn failed() -> Option<CpuStart> {
+        Some(CpuStart {
+            sensor: None,
+            failed: true,
+            installed: false,
+        })
+    }
+}
+
+fn has_arg(name: &str) -> bool {
+    std::env::args_os().skip(1).any(|a| a == name)
+}
+
+/// The one place the CPU sensor is opened (startup, enabling CPU, retrying the driver).
+/// Relaunches elevated or installs the PawnIO driver when that is what's missing.
+/// `None`: an elevated instance was started and this one should exit.
+/// `install_agreed`: the user already agreed to the install, in the instance that asked.
+/// Shows dialogs and the UAC prompt: never call it inside `with_state`.
+fn start_cpu(install_agreed: bool) -> Option<CpuStart> {
+    // Passed to the elevated instance: it never relaunches again, even if elevation
+    // didn't stick.
+    let relaunched = has_arg("--elevated");
+    let failed = match PawnIoCpu::open() {
+        Ok(cpu) => {
+            return Some(CpuStart {
+                sensor: Some(Box::new(cpu)),
+                failed: false,
+                installed: false,
+            })
+        }
+        // No PawnIO module for this CPU: the driver can't help.
+        Err(PawnIoError::UnsupportedCpu) => false,
+        Err(PawnIoError::AccessDenied) if !relaunched && !is_elevated() => {
+            return relaunch("--elevated")
+        }
+        // Only a missing PawnIOLib.dll means "not installed"; one that is there but
+        // doesn't load or lacks an export is broken, and installing won't be offered.
+        Err(PawnIoError::NotInstalled) if !pawnio::lib_present() => {
+            return install_driver(install_agreed, relaunched)
+        }
+        // Also Load(E_ACCESSDENIED) from creating the PCI mutex, which elevating won't fix.
+        Err(_) => true,
+    };
+    Some(CpuStart {
+        sensor: None,
+        failed,
+        installed: false,
+    })
+}
+
+fn relaunch(args: &str) -> Option<CpuStart> {
+    match elevation::relaunch_elevated(args) {
+        Relaunch::Started => None,
+        Relaunch::Cancelled | Relaunch::Failed => CpuStart::failed(),
+    }
+}
+
+/// Asks first unless `agreed`, then installs PawnIO here when elevated, else in an elevated
+/// relaunch.
+fn install_driver(agreed: bool, relaunched: bool) -> Option<CpuStart> {
+    if !agreed && message_box(INSTALL_PROMPT, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK {
+        return CpuStart::failed();
+    }
+    if !is_elevated() {
+        if relaunched {
+            return CpuStart::failed();
+        }
+        return relaunch("--elevated --install-driver");
+    }
+    if let Err(e) = pawnio_setup::install() {
+        error_box("The CPU temperature driver could not be installed.", &e);
+        return CpuStart::failed();
+    }
+    let sensor = PawnIoCpu::open()
+        .ok()
+        .map(|c| Box::new(c) as Box<dyn Sensor>);
+    Some(CpuStart {
+        failed: sensor.is_none(),
+        sensor,
+        installed: true,
+    })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -303,18 +520,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     0
 }
 
-/// Opens the sensor of `k`; it is dropped again when the kind is disabled.
-fn open_sensor(k: Kind) -> Option<Box<dyn Sensor>> {
-    match k {
-        Kind::Gpu => crate::sensor::d3dkmt::open_gpu_sensor(),
-        Kind::Cpu => PawnIoCpu::open().ok().map(|c| Box::new(c) as Box<dyn Sensor>),
-    }
-}
-
 pub fn run() {
-    let settings = Settings::load();
-    let cpu = settings.cpu_enabled.then(|| open_sensor(Kind::Cpu)).flatten();
-    let gpu = settings.gpu_enabled.then(|| open_sensor(Kind::Gpu)).flatten();
+    let mut settings = Settings::load();
+    // Sensors are opened only while their kind is enabled, and dropped when it is disabled.
+    let mut cpu = None;
+    let mut cpu_driver_failed = false;
+    if settings.cpu_enabled {
+        // No window or state exists yet, so dialogs are safe here.
+        let Some(start) = start_cpu(has_arg("--install-driver")) else {
+            // The elevated instance takes over.
+            return;
+        };
+        if start.installed {
+            settings.pawnio_installed_by_traytemp = true;
+            let _ = settings.save();
+        }
+        cpu = start.sensor;
+        cpu_driver_failed = start.failed;
+    }
+    let gpu = settings.gpu_enabled.then(open_gpu_sensor).flatten();
     let mut app = App::new(settings, cpu, gpu);
 
     // SAFETY: standard window class and window creation; the class name and title are
@@ -366,6 +590,7 @@ pub fn run() {
         style: font::taskbar_style(),
         display_on: true,
         power: 0,
+        cpu_driver_failed,
     };
     st.reload_font(st.style);
     for k in KINDS {
