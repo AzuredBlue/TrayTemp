@@ -3,6 +3,9 @@
 pub mod cpu_decode;
 pub mod nvml;
 
+#[cfg(windows)]
+pub mod d3dkmt;
+
 #[cfg(target_os = "linux")]
 pub mod hwmon;
 
