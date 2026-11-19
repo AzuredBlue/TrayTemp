@@ -48,20 +48,20 @@ const INSTALL_ARGS: &str = "-install -silent";
 const UNINSTALL_ARGS: &str = "-uninstall -silent";
 
 /// Downloads the PawnIO installer, checks its signature and runs it silently. Needs elevation.
-/// Succeeds when the driver is usable afterwards.
+/// Succeeds when the installer exits with 0 and the driver is usable afterwards.
 pub fn install() -> Result<(), String> {
     let setup = fetch_verified()?;
     // `setup` keeps the file locked until the installer has exited, then deletes it.
     let code = run_and_wait(&setup.path, INSTALL_ARGS)?;
     drop(setup);
-    if pawnio_installed() {
-        Ok(())
-    } else if code != 0 {
+    if code != 0 {
         Err(format!(
             "The PawnIO installer failed with exit code {code}."
         ))
-    } else {
+    } else if !pawnio_installed() {
         Err("The PawnIO installer finished, but the driver is still not available.".into())
+    } else {
+        Ok(())
     }
 }
 
