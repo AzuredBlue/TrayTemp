@@ -20,7 +20,6 @@ use windows_sys::Win32::Foundation::{
     LPARAM, MAX_PATH,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
-use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
@@ -495,7 +494,8 @@ fn sync_copy(dest: &Path, dir: &Path) -> Result<(), String> {
 
 /// Removes the Program Files copy and its folder, for an elevated process once the task that
 /// pointed at it is gone. Best effort: a copy that is in use stays and the next elevated start
-/// tries again. The running copy itself can only go at the next restart.
+/// tries again. When this process runs from the copy, the copy stays: it may be the only
+/// TrayTemp the user has.
 fn remove_copy() {
     let Some(dest) = program_files_exe() else {
         return;
@@ -503,17 +503,10 @@ fn remove_copy() {
     let Some(dir) = dest.parent() else {
         return;
     };
-    if !dest.exists() {
+    if !dest.exists() || std::env::current_exe().is_ok_and(|exe| same_file(&exe, &dest)) {
         return;
     }
-    if std::env::current_exe().is_ok_and(|exe| same_file(&exe, &dest)) {
-        for path in [&dest, dir] {
-            let path = wide(path);
-            // SAFETY: a NUL-terminated path; a null new name means delete at restart. The
-            // file is queued before its folder, which has to be empty by then.
-            unsafe { MoveFileExW(path.as_ptr(), null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
-        }
-    } else if std::fs::remove_file(&dest).is_ok() {
+    if std::fs::remove_file(&dest).is_ok() {
         let _ = std::fs::remove_dir(dir);
     }
 }
