@@ -6,19 +6,37 @@ use windows_sys::w;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, GdiFlush,
-    GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TextOutW, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_NATURAL_QUALITY, DIB_RGB_COLORS, FW_NORMAL, LOGFONTW,
-    TRANSPARENT,
+    GetSysColor, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TextOutW,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_NATURAL_QUALITY, COLOR_WINDOWTEXT,
+    DIB_RGB_COLORS, FW_NORMAL, LOGFONTW, TRANSPARENT,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+    SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
 };
 
 use crate::render::{AlphaMask, TextRasterizer, TextStyle};
 
-/// Plain text like the taskbar's own: black on a light taskbar, white on a dark one.
+/// Plain text like the taskbar's own: the high-contrast text colour when high contrast is on,
+/// else black on a light taskbar and white on a dark one.
 pub fn taskbar_style() -> TextStyle {
+    let mut hc = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hc` is a HIGHCONTRASTW with its size in cbSize, as the call requires.
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, (&raw mut hc).cast(), 0)
+    };
+    if ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0 {
+        // SAFETY: reads a system colour; COLOR_WINDOWTEXT is a valid index.
+        let c = unsafe { GetSysColor(COLOR_WINDOWTEXT) }; // 0x00BBGGRR
+        return TextStyle {
+            fill: (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF),
+            outline: false,
+        };
+    }
     let mut light = 0u32;
     let mut len = size_of::<u32>() as u32;
     // SAFETY: reads one DWORD into `light`, whose size is in `len`.
@@ -54,15 +72,24 @@ pub fn ui_font() -> Option<LOGFONTW> {
     (ok != 0).then_some(ncm.lfMessageFont)
 }
 
+/// True if text in this 0xRRGGBB colour is light, by its luma.
+pub fn is_light(fill: u32) -> bool {
+    let (r, g, b) = (fill >> 16 & 0xFF, fill >> 8 & 0xFF, fill & 0xFF);
+    r * 299 + g * 587 + b * 114 >= 128_000
+}
+
 /// Draws text in a font face as a gray coverage mask. Every GDI object lives only for one
 /// `rasterize` call.
 pub struct GdiText {
     font: LOGFONTW,
+    /// Raise the coverage, for light text on a dark taskbar.
+    boost: bool,
 }
 
 impl GdiText {
-    pub fn new(font: LOGFONTW) -> GdiText {
-        GdiText { font }
+    /// `light`: the mask will be filled with a light colour.
+    pub fn new(font: LOGFONTW, light: bool) -> GdiText {
+        GdiText { font, boost: light }
     }
 }
 
@@ -140,12 +167,15 @@ impl TextRasterizer for GdiText {
                     SetTextColor(dc, 0x00FF_FFFF);
                     TextOutW(dc, pad, pad, text.as_ptr(), text.len() as i32);
                     GdiFlush();
-                    // White on black: the mean of the subpixel channels is the coverage, raised
-                    // by gamma 2 so strokes are as solid as the taskbar's own text.
+                    // White on black: the mean of the subpixel channels is the coverage. For
+                    // light text it is raised by gamma 2 so strokes are as solid as the dark
+                    // taskbar's own text. Dark text uses it unchanged, which matches GDI's own
+                    // black text on a light background.
                     let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), n);
+                    let boost = self.boost;
                     let coverage = |p: &u32| {
                         let c = ((p >> 16 & 0xFF) + (p >> 8 & 0xFF) + (p & 0xFF)) / 3;
-                        (c * 255).isqrt() as u8
+                        if boost { (c * 255).isqrt() as u8 } else { c as u8 }
                     };
                     let a: Vec<u8> = pixels.iter().map(coverage).collect();
                     mask = Some(crop(&a, w as u32, h as u32));

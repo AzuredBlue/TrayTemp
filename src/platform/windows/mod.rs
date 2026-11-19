@@ -46,8 +46,8 @@ struct State {
     app: App,
     tray: TrayIcons,
     icon_size: u32,
-    /// Face of the UI font in use, to notice when the user changes it.
-    face: Option<[u16; 32]>,
+    /// Face of the UI font in use and whether the text is light, to notice when either changes.
+    face: Option<([u16; 32], bool)>,
     font: Option<OsFont>,
     style: TextStyle,
     display_on: bool,
@@ -143,15 +143,17 @@ impl State {
         }
     }
 
-    /// Reads the UI font again; true if its face changed.
-    fn reload_font(&mut self) -> bool {
+    /// Reads the UI font again; true if its face changed, or the text in `style` turned from
+    /// light to dark or back, which changes how it is drawn.
+    fn reload_font(&mut self, style: TextStyle) -> bool {
         let lf = font::ui_font();
-        let face = lf.map(|f| f.lfFaceName);
+        let light = font::is_light(style.fill);
+        let face = lf.map(|f| (f.lfFaceName, light));
         if face == self.face {
             return false;
         }
         self.face = face;
-        self.font = lf.map(|f| OsFont::new(Box::new(GdiText::new(f))));
+        self.font = lf.map(|f| OsFont::new(Box::new(GdiText::new(f, light))));
         true
     }
 
@@ -159,7 +161,7 @@ impl State {
     fn recheck(&mut self) {
         let size = icon_size();
         let style = font::taskbar_style();
-        let font_changed = self.reload_font();
+        let font_changed = self.reload_font(style);
         if size == self.icon_size && style == self.style && !font_changed {
             return;
         }
@@ -365,7 +367,7 @@ pub fn run() {
         display_on: true,
         power: 0,
     };
-    st.reload_font();
+    st.reload_font(st.style);
     for k in KINDS {
         if st.app.enabled(k) {
             st.show_icon(k);
