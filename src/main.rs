@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[allow(dead_code)]
+mod app;
 mod platform;
 #[allow(dead_code)]
 mod render;
