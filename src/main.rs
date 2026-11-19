@@ -2,6 +2,8 @@
 
 mod platform;
 #[allow(dead_code)]
+mod render;
+#[allow(dead_code)]
 mod sensor;
 #[allow(dead_code)]
 mod settings;
