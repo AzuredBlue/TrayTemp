@@ -1,0 +1,8 @@
+[target.x86_64-pc-windows-msvc]
+# Link the VC runtime statically, so no Visual C++ redistributable is needed, but use the
+# Universal CRT that ships with Windows 10 and 11 instead of a static copy (much smaller).
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=/NODEFAULTLIB:libucrt.lib",
+  "-C", "link-arg=/DEFAULTLIB:ucrt.lib",
+]
