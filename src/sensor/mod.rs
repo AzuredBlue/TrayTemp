@@ -6,6 +6,9 @@ pub mod nvml;
 #[cfg(windows)]
 pub mod d3dkmt;
 
+#[cfg(windows)]
+pub mod pawnio;
+
 #[cfg(target_os = "linux")]
 pub mod hwmon;
 

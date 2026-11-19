@@ -25,7 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::{App, Changes};
 use crate::render::render_value;
-use crate::sensor::Kind;
+use crate::sensor::pawnio::PawnIoCpu;
+use crate::sensor::{Kind, Sensor};
 use crate::settings::{DisplayMode, Settings};
 use tray::{TrayIcons, WM_TRAY};
 
@@ -278,7 +279,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 pub fn run() {
     let settings = Settings::load();
     let gpu = crate::sensor::d3dkmt::open_gpu_sensor();
-    let mut app = App::new(settings, None, gpu);
+    let cpu: Option<Box<dyn Sensor>> = if settings.cpu_enabled {
+        PawnIoCpu::open().ok().map(|c| Box::new(c) as Box<dyn Sensor>)
+    } else {
+        None
+    };
+    let mut app = App::new(settings, cpu, gpu);
 
     // SAFETY: standard window class and window creation; the class name and title are
     // static NUL-terminated strings.
