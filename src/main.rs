@@ -2,6 +2,8 @@
 
 mod platform;
 #[allow(dead_code)]
+mod settings;
+#[allow(dead_code)]
 mod stats;
 
 fn main() {
