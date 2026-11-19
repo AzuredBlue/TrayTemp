@@ -46,6 +46,9 @@ const TIMER_ID: usize = 1;
 const WM_DISPLAY_STATE: u32 = WM_APP + 2;
 /// Posted to ourselves: the tray icon size, the UI font or the taskbar theme may have changed.
 const WM_RECHECK: u32 = WM_APP + 3;
+/// Posted by the autostart worker: lParam is a `Box<String>` (from `Box::into_raw`) with what
+/// went wrong; the window procedure takes it over.
+const WM_AUTOSTART_ERROR: u32 = WM_APP + 4;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -336,7 +339,7 @@ fn follow_up(hwnd: HWND, follow: FollowUp) {
                     st.cpu_started(start);
                     st.app.settings.clone()
                 }) {
-                    elevation_need_changed(&s);
+                    elevation_need_changed(hwnd, &s);
                 }
                 false
             }
@@ -344,20 +347,17 @@ fn follow_up(hwnd: HWND, follow: FollowUp) {
         FollowUp::CpuDisabled => {
             offer_uninstall();
             if let Some(s) = with_state(|st| st.app.settings.clone()) {
-                elevation_need_changed(&s);
+                elevation_need_changed(hwnd, &s);
             }
             false
         }
         FollowUp::Autostart => {
-            if let Some(s) = with_state(|st| st.app.settings.clone()) {
-                if let Err(e) = autostart::set_autostart(s.autostart, s.cpu_enabled) {
-                    error_box("Start with Windows could not be changed.", &e);
-                    // The checkmark follows what the system now does.
-                    with_state(|st| {
-                        st.app.settings.autostart = !s.autostart;
-                        let _ = st.app.settings.save();
-                    });
-                }
+            // The checkmark is the user's choice and stays when applying it fails; the error
+            // is shown and the next start tries again.
+            if let Some((on, cpu)) =
+                with_state(|st| (st.app.settings.autostart, st.app.settings.cpu_enabled))
+            {
+                autostart::request(hwnd, on, cpu);
             }
             false
         }
@@ -388,13 +388,10 @@ fn offer_uninstall() {
 
 /// Hook for when enabling or disabling CPU changed whether TrayTemp needs to run elevated:
 /// autostart switches between its elevated and its plain form here. Called with the state
-/// released, so it may wait for other programs and for the UAC prompt.
-fn elevation_need_changed(settings: &Settings) {
-    if !settings.autostart {
-        return;
-    }
-    if let Err(e) = autostart::set_autostart(true, settings.cpu_enabled) {
-        error_box("Start with Windows could not be updated.", &e);
+/// released; the work itself runs on the autostart worker.
+fn elevation_need_changed(hwnd: HWND, settings: &Settings) {
+    if settings.autostart {
+        autostart::request(hwnd, true, settings.cpu_enabled);
     }
 }
 
@@ -528,6 +525,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { PostMessageW(hwnd, WM_RECHECK, 0, 0) };
         }
         WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, State::recheck),
+        WM_AUTOSTART_ERROR => {
+            // SAFETY: posted by `autostart::request`'s worker with a `Box<String>` we now own.
+            let why = unsafe { Box::from_raw(lp as *mut String) };
+            error_box("Start with Windows could not be changed.", &why);
+        }
         WM_DESTROY => {
             if let Some(mut st) = STATE.take() {
                 st.shutdown();
@@ -564,9 +566,6 @@ pub fn run() {
         }
         cpu = start.sensor;
         cpu_driver_failed = start.failed;
-    }
-    if settings.autostart {
-        autostart::sync_at_startup(settings.cpu_enabled);
     }
     let gpu = settings.gpu_enabled.then(open_gpu_sensor).flatten();
     let mut app = App::new(settings, cpu, gpu);
@@ -631,6 +630,7 @@ pub fn run() {
     st.start_timer();
     // The system answers the registration with the current state, which is "on" here.
     st.power = power::register_display_notifications(hwnd);
+    autostart::sync_at_startup(hwnd, st.app.settings.autostart, st.app.settings.cpu_enabled);
     STATE.set(Some(st));
 
     let mut msg = MSG::default();

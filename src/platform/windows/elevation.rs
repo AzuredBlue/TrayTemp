@@ -11,7 +11,7 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
@@ -75,20 +75,26 @@ fn runas(exe: &Path, args: &str, mask: u32, show: i32) -> Result<HANDLE, Relaunc
         nShow: show,
         ..Default::default()
     };
-    // SAFETY: ShellExecuteEx asks for COM on the calling thread. A repeated call only adds a
-    // reference, and this thread keeps COM until the process ends.
-    unsafe {
-        CoInitializeEx(
+    // SAFETY: ShellExecuteEx asks for COM on the calling thread. It is initialised for this
+    // call only (NOASYNC: the call is done when it returns); a thread that already has COM
+    // just counts one more reference. `info` is initialised with its size and the strings
+    // outlive the call.
+    let (ok, err) = unsafe {
+        let com = CoInitializeEx(
             null(),
             (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
+        ) >= 0;
+        let ok = ShellExecuteExW(&mut info) != 0;
+        let err = GetLastError();
+        if com {
+            CoUninitialize();
+        }
+        (ok, err)
     };
-    // SAFETY: `info` is initialised with its size; the strings outlive the call.
-    if unsafe { ShellExecuteExW(&mut info) } != 0 {
+    if ok {
         return Ok(info.hProcess);
     }
-    // SAFETY: reads this thread's last error, set by the failed call above.
-    if unsafe { GetLastError() } == ERROR_CANCELLED {
+    if err == ERROR_CANCELLED {
         Err(Relaunch::Cancelled)
     } else {
         Err(Relaunch::Failed)
