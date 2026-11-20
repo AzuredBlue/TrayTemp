@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForSystem, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
 };
+use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
@@ -759,6 +760,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 pub fn run() {
+    // TrayTemp takes no text input, so it needs no input method: without one, its windows
+    // don't load the text input framework.
+    // SAFETY: plain call; u32::MAX means every thread of this process.
+    unsafe { ImmDisableIME(u32::MAX) };
     if !claim_single_instance() {
         return;
     }
