@@ -71,6 +71,10 @@ cargo build --release
 
 Windows needs the MSVC build tools and the Windows SDK. Linux release builds in CI use cargo-zigbuild, targeting glibc 2.28.
 
+## Licence
+
+TrayTemp is licensed under the [MIT License](LICENSE). The PawnIO modules in `res/pawnio` are not covered by it; they keep their own licence, listed below.
+
 ## Third-party notices
 
 - **PawnIO modules** (`res/pawnio`: `IntelMSR.bin`, `AMDFamily17.bin`): from [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules) 0.2.12, licensed LGPL-2.1. The licence text is `res/pawnio/COPYING`; checksums are in `res/pawnio/README.md`.
