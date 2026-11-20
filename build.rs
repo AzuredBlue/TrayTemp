@@ -11,10 +11,14 @@ fn main() {
             .join("traytemp.manifest");
         // Resolve the exe's own static imports from System32 only, never from its folder.
         println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
-        // Only the driver install and Start with Windows use these: load them on first use, not
-        // at every start. The delay-load helper loads with the search order `main` limits to
-        // System32.
-        for dll in ["winhttp.dll", "wintrust.dll", "crypt32.dll", "secur32.dll"] {
+        // Load these on first use instead of at every start: the driver install and Start with
+        // Windows need the first four; COM, the strip's tooltips and the tray icons the others,
+        // each only in some modes. The delay-load helper loads with the search order `main`
+        // limits to System32.
+        for dll in [
+            "winhttp.dll", "wintrust.dll", "crypt32.dll", "secur32.dll",
+            "ole32.dll", "oleaut32.dll", "comctl32.dll", "shell32.dll",
+        ] {
             println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
         }
         println!("cargo:rustc-link-arg-bins=delayimp.lib");
