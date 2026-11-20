@@ -474,10 +474,10 @@ fn follow_up(hwnd: HWND, follow: FollowUp) {
         FollowUp::Autostart => {
             // The checkmark is the user's choice and stays when applying it fails; the error
             // is shown and the next start tries again.
-            if let Some((on, cpu)) =
-                with_state(|st| (st.app.settings.autostart, st.app.settings.cpu_enabled))
+            if let Some((on, elevated)) =
+                with_state(|st| (st.app.settings.autostart, needs_elevation(&st.app.settings)))
             {
-                autostart::request(hwnd, on, cpu);
+                autostart::request(hwnd, on, elevated);
             }
         }
     }
@@ -540,8 +540,14 @@ fn offer_uninstall() -> bool {
 /// released; the work itself runs on the autostart worker.
 fn elevation_need_changed(hwnd: HWND, settings: &Settings) {
     if settings.autostart {
-        autostart::request(hwnd, true, settings.cpu_enabled);
+        autostart::request(hwnd, true, needs_elevation(settings));
     }
+}
+
+/// CPU is on and PawnIO has a module for this CPU: only then does TrayTemp need to start
+/// elevated. Otherwise an elevated logon task would run it as administrator for nothing.
+fn needs_elevation(settings: &Settings) -> bool {
+    settings.cpu_enabled && pawnio::cpu_vendor() != pawnio::Vendor::Other
 }
 
 /// A TrayTemp message box, brought to the foreground. Runs a modal loop: never call it inside
@@ -756,7 +762,9 @@ pub fn run() {
     let mut cpu_driver_failed = false;
     if settings.cpu_enabled {
         // No window or state exists yet, so dialogs are safe here.
-        let Some(start) = start_cpu(has_arg("--install-driver")) else {
+        // Only an instance relaunched by one that asked counts as agreed; a plain
+        // `--install-driver` from anyone else still gets TrayTemp's own prompt first.
+        let Some(start) = start_cpu(has_arg("--elevated") && has_arg("--install-driver")) else {
             // The elevated instance takes over.
             return;
         };
@@ -834,7 +842,7 @@ pub fn run() {
     st.start_timer();
     // The system answers the registration with the current state, which is "on" here.
     st.power = power::register_display_notifications(hwnd);
-    autostart::sync_at_startup(hwnd, st.app.settings.autostart, st.app.settings.cpu_enabled);
+    autostart::sync_at_startup(hwnd, st.app.settings.autostart, needs_elevation(&st.app.settings));
     STATE.set(Some(st));
 
     let mut msg = MSG::default();
