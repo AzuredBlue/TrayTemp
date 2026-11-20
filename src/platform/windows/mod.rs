@@ -33,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, IDOK, IDYES, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND, MB_YESNO,
     MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, MSGFLT_ALLOW, PBT_POWERSETTINGCHANGE, SM_CXSMICON,
-    WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL,
+    SPI_SETWORKAREA, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL,
     WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -710,8 +710,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAY_STATE => run_or_repost(hwnd, msg, wp, lp, |st| st.set_display(wp != 0)),
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            // Displays and scaling also change which taskbars there are.
-            let full = (msg != WM_SETTINGCHANGE) as usize;
+            // Displays and scaling also change which taskbars there are. A new monitor's
+            // taskbar may only appear after WM_DISPLAYCHANGE; it changes the work area then.
+            let full = (msg != WM_SETTINGCHANGE || wp == SPI_SETWORKAREA as usize) as usize;
             // SAFETY: plain post to our own window.
             unsafe { PostMessageW(hwnd, WM_RECHECK, full, 0) };
         }
