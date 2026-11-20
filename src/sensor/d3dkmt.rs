@@ -16,8 +16,14 @@ const VENDOR_NVIDIA: u32 = 0x10DE;
 const TYPE_SOFTWARE_DEVICE: u32 = 1 << 2;
 const TYPE_HYBRID_DISCRETE: u32 = 1 << 4;
 
+/// Failed queries after which the adapter is looked up again, and again after as many more.
+const REOPEN_EVERY: u32 = 30;
+
 pub struct D3dkmtSensor {
     adapter: u32,
+    /// Failed queries in a row. A driver update or reset replaces the adapter, and the old
+    /// handle answers nothing from then on.
+    failures: u32,
 }
 
 impl Drop for D3dkmtSensor {
@@ -57,7 +63,15 @@ impl Sensor for D3dkmtSensor {
         // Unverified: whether this query wakes a sleeping hybrid-laptop dGPU. If it does,
         // a non-waking power-state check (returning `Reading::Asleep`) belongs right here.
         // A successful query reporting 0 means the GPU is in a low-power state: Asleep.
-        match read_temp(self.adapter) {
+        let temp = read_temp(self.adapter);
+        self.failures = if temp.is_some() { 0 } else { self.failures.wrapping_add(1) };
+        if self.failures > 0 && self.failures.is_multiple_of(REOPEN_EVERY) {
+            if let Some((mut fresh, _, _)) = pick() {
+                // `fresh` closes the old handle when it drops.
+                std::mem::swap(&mut self.adapter, &mut fresh.adapter);
+            }
+        }
+        match temp {
             Some(t) if valid_temp(t) => Reading::Temp(t),
             Some(0.0) => Reading::Asleep,
             _ => Reading::Unavailable,
@@ -146,7 +160,7 @@ fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
         }
     }
     best.map(|b| {
-        let sensor = D3dkmtSensor { adapter: b.adapter };
+        let sensor = D3dkmtSensor { adapter: b.adapter, failures: 0 };
         (sensor, b.vendor, b.has_temp || b.asleep)
     })
 }
