@@ -4,12 +4,12 @@ A small lightweight tray app for Windows 10/11 and KDE Plasma that shows the CPU
 
 ## Footprint
 
-Binary sizes are from release builds.
+Binary sizes are those of the released files.
 
 | Platform | Binary | Memory | CPU |
 |---|---|---|---|
-| Windows | 310 KB | ~2 MB | ~0 % |
-| Linux (KDE Plasma 6) | 1.6 MB | ~9 MB | ~0 % |
+| Windows | 306 KB | ~2 MB | ~0 % |
+| Linux (KDE Plasma 6) | 1.7 MB | ~9 MB | ~0 % |
 
 Windows memory is the private working set (Task Manager, Details, "Memory" column); the total working set is larger because it includes pages shared with the system. Linux memory is RSS.
 
