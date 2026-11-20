@@ -31,6 +31,3 @@ pub const DIGITS_NARROW: [[u8; 7]; 10] = [
 
 /// A dash, drawn twice for "no value". 5x7 grid.
 pub const DASH: [u8; 7] = [0, 0, 0, 0b11111, 0, 0, 0];
-
-/// Degree sign, 3x3 grid, drawn at the top of the digit row.
-pub const DEGREE: [u8; 3] = [0b111, 0b101, 0b111];

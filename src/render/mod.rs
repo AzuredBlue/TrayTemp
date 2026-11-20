@@ -282,10 +282,10 @@ pub fn render_glyph(kind: Kind, size: u32) -> Canvas {
     m.into_canvas(OUTLINED)
 }
 
-/// The strip's `54°` (`--` without a value) in the OS font at `px`.
+/// The strip's `54` (`--` without a value) in the OS font at `px`.
 fn os_label(f: &mut OsFont, value: Option<i32>, px: u32) -> Option<AlphaMask> {
     let text = match value {
-        Some(v) => format!("{}\u{b0}", v.clamp(0, 999)),
+        Some(v) => v.clamp(0, 999).to_string(),
         None => "--".to_string(),
     };
     f.raster.rasterize(&text, px)
@@ -304,7 +304,7 @@ pub struct Strip {
 /// closest is a monitor), so the GPU icon is always the bitmap one.
 pub const ICON_CODE_POINTS: [Option<char>; 2] = [Some('\u{E950}'), None];
 
-/// Taskbar-text strip: `[icon] number°` per enabled sensor (outer `None` = disabled), text at
+/// Taskbar-text strip: `[icon] number` per enabled sensor (outer `None` = disabled), text at
 /// `px` (em height) in a canvas `height` tall; width 0 if none are enabled.
 /// `font` draws the labels and `icons` the sensor icons (see `ICON_CODE_POINTS`); without them
 /// the bitmap digits and glyphs are used.
@@ -332,7 +332,6 @@ pub fn render_text_strip(
     let glyph_w = 16 * gs;
     let gap = px / 2;
     let group_gap = px * 3 / 2;
-    let deg_w = 3 * s;
     let margin = u32::from(style.outline);
 
     let mut width = 0;
@@ -344,15 +343,7 @@ pub fn render_text_strip(
         }
         count += 1;
         width += icon_masks[i].as_ref().map_or(glyph_w, |m| m.w) + gap;
-        match &labels[i] {
-            Some(t) => width += t.w,
-            None => {
-                width += number_cells(*v, false) * s;
-                if v.is_some() {
-                    width += s + deg_w;
-                }
-            }
-        }
+        width += labels[i].as_ref().map_or(number_cells(*v, false) * s, |t| t.w);
     }
     let mut spans = [None; 2];
     if count == 0 {
@@ -387,18 +378,10 @@ pub fn render_text_strip(
         } else {
             let ty = (height as i32 - (7 * s) as i32) / 2;
             x = draw_number(&mut m, *v, x, ty, s, false);
-            if v.is_some() {
-                m.blit(&widen_deg(), 3, x + s as i32, ty, s);
-                x += (s + deg_w) as i32;
-            }
         }
         spans[i] = Some((start as u32, x as u32));
     }
     Strip { canvas: m.into_canvas(style), spans }
-}
-
-fn widen_deg() -> [u32; 3] {
-    [font::DEGREE[0] as u32, font::DEGREE[1] as u32, font::DEGREE[2] as u32]
 }
 
 #[cfg(test)]

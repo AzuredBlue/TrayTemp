@@ -1,5 +1,5 @@
 //! Taskbar-text mode: a layered child window of each taskbar, left of its notification area,
-//! showing `[icon] 54°  [icon] 61°` in the taskbar's own font and colour.
+//! showing `[icon] 54  [icon] 61` in the taskbar's own font and colour.
 //!
 //! The windows are children of Explorer's taskbar, so they share its input queue: nothing on the
 //! UI thread may block while they exist.
