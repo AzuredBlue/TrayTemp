@@ -15,7 +15,7 @@ Windows memory is the private working set (Task Manager, Details, "Memory" colum
 
 ## Download and run
 
-TrayTemp is a single executable (`traytemp.exe` on Windows, `traytemp` on Linux). There is no installer: download it and run it. Releases are attached to the tags of this repository.
+TrayTemp is a single executable (`traytemp.exe` on Windows, `traytemp-linux-x86_64` on Linux). There is no installer: download it and run it. On Linux, make it executable first (`chmod +x traytemp-linux-x86_64`). Releases are attached to the tags of this repository.
 
 ## Screenshots
 
