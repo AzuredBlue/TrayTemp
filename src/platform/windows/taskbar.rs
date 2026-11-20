@@ -106,13 +106,6 @@ pub struct TaskbarText {
     all: bool,
     /// Reports Explorer's window moves (see `on_event`); null if it couldn't be installed.
     hook: HWINEVENTHOOK,
-    icons: Option<OsFont>,
-    /// Whether `icons` was made for light text; it is made again when the taskbar theme flips.
-    icons_light: bool,
-}
-
-fn icon_font(light: bool) -> Option<OsFont> {
-    font::icon_font().map(|lf| OsFont::new(Box::new(font::GdiText::new(lf, light))))
 }
 
 /// Where the strip's left edge goes: `w` wide with `gap` to its right, ending at `anchor`, and
@@ -484,13 +477,13 @@ fn show(b: &Bar, style: TextStyle) {
 }
 
 /// Renders `b`'s strip from the app's values and shows it, placed and with its tooltip areas.
-fn render_bar(b: &mut Bar, app: &App, icons: Option<&mut OsFont>, look: &mut Look, metrics: &(u32, Option<LOGFONTW>)) {
+fn render_bar(b: &mut Bar, app: &App, look: &mut Look, metrics: &(u32, Option<LOGFONTW>)) {
     let value = |k| app.enabled(k).then(|| app.shown(k));
     let (tb, notify) = rects_of(b);
     let dpi = dpi_of(b.taskbar);
     let th = (tb[3] - tb[1]) as u32;
     let px = scale(metrics.0 as i32, dpi) as u32;
-    let strip = render_text_strip(value(Kind::Cpu), value(Kind::Gpu), px, th, look.font.as_deref_mut(), icons, look.style);
+    let strip = render_text_strip(value(Kind::Cpu), value(Kind::Gpu), px, th, look.font.as_deref_mut(), look.style);
     // The strip carries its own padding, so the gap to the neighbour shrinks by it.
     b.gap = (scale(GAP, dpi) - strip_pad(px) as i32).max(0);
     b.clock_off = if b.notify.is_null() {
@@ -540,8 +533,7 @@ impl TaskbarText {
             };
             RegisterClassW(&wc);
         });
-        let light = font::is_light(look.style.fill);
-        let mut t = TaskbarText { bars: Vec::new(), all, hook: null_mut(), icons: icon_font(light), icons_light: light };
+        let mut t = TaskbarText { bars: Vec::new(), all, hook: null_mut() };
         t.relayout(all, app, look);
         // SAFETY: plain query.
         let main_taskbar = unsafe { FindWindowW(w!("Shell_TrayWnd"), null()) };
@@ -647,14 +639,9 @@ impl TaskbarText {
 
     /// Draws every strip again from the app's values.
     pub fn redraw(&mut self, app: &App, look: &mut Look) {
-        let light = font::is_light(look.style.fill);
-        if light != self.icons_light {
-            self.icons = icon_font(light);
-            self.icons_light = light;
-        }
         let metrics = ui_metrics();
         for b in &mut self.bars {
-            render_bar(b, app, self.icons.as_mut(), look, &metrics);
+            render_bar(b, app, look, &metrics);
         }
     }
 
@@ -677,7 +664,7 @@ impl TaskbarText {
             tray_moved |= notify != b.notify_rect;
             if force || [tb[2] - tb[0], tb[3] - tb[1]] != b.size || dpi_of(b.taskbar) != b.dpi {
                 let m = metrics.get_or_insert_with(ui_metrics);
-                render_bar(b, app, self.icons.as_mut(), look, m);
+                render_bar(b, app, look, m);
                 continue;
             }
             b.notify_rect = notify;

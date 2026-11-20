@@ -321,11 +321,6 @@ pub struct Strip {
     pub spans: [Option<(u32, u32)>; 2],
 }
 
-/// Icon-font code points for the CPU and GPU icons, indexed by `Kind::index()`: a chip, in both
-/// Segoe Fluent Icons and Segoe MDL2 Assets. Those fonts have no graphics-card glyph (the
-/// closest is a monitor), so the GPU icon is always the bitmap one.
-pub const ICON_CODE_POINTS: [Option<char>; 2] = [Some('\u{E950}'), None];
-
 /// Padding at each end of a strip span, for text at `px`: the room a hover highlight needs.
 pub fn strip_pad(px: u32) -> u32 {
     px / 2
@@ -335,27 +330,19 @@ pub fn strip_pad(px: u32) -> u32 {
 /// `px` (em height) in a canvas `height` tall; width 0 if none are enabled. Every span has
 /// `strip_pad(px)` of room at both ends, and the gap between spans is shortened to match, so the
 /// text sits where it would without padding.
-/// `font` draws the labels and `icons` the sensor icons (see `ICON_CODE_POINTS`); without them
-/// the bitmap digits and glyphs are used.
+/// `font` draws the labels; without it the bitmap digits are used. The sensor icons are always
+/// the bitmap glyphs: they stay pixel-sharp, where an icon font's thin strokes blur.
 pub fn render_text_strip(
     cpu: Option<Option<i32>>,
     gpu: Option<Option<i32>>,
     px: u32,
     height: u32,
     mut font: Option<&mut OsFont>,
-    mut icons: Option<&mut OsFont>,
     style: TextStyle,
 ) -> Strip {
     let groups: [(Kind, Option<Option<i32>>); 2] = [(Kind::Cpu, cpu), (Kind::Gpu, gpu)];
     let labels = groups.map(|(_, v)| os_label(font.as_deref_mut()?, v?, px));
-    // Icons are a little larger than the text.
-    let icon_px = px * 4 / 3;
-    let icon_masks = groups.map(|(k, v)| {
-        v?;
-        let ch = ICON_CODE_POINTS[k.index()]?.to_string();
-        icons.as_deref_mut()?.raster.rasterize(&ch, icon_px)
-    });
-    // Bitmap fallbacks.
+    // Bitmap glyphs, and the bitmap digits' fallback scale.
     let s = (px * 2 / 3 / 7).max(1);
     let gs = (px / 12).max(1);
     let glyph_w = 16 * gs;
@@ -373,7 +360,7 @@ pub fn render_text_strip(
         }
         count += 1;
         width += 2 * pad;
-        width += icon_masks[i].as_ref().map_or(glyph_w, |m| m.w) + gap;
+        width += glyph_w + gap;
         width += labels[i].as_ref().map_or(number_cells(*v, false) * s, |t| t.w);
     }
     let mut spans = [None; 2];
@@ -392,17 +379,9 @@ pub fn render_text_strip(
         first = false;
         let start = x;
         x += pad as i32;
-        match &icon_masks[i] {
-            Some(t) => {
-                m.draw(t, x, (height as i32 - t.h as i32) / 2);
-                x += t.w as i32;
-            }
-            None => {
-                let gy = (height as i32 - (16 * gs) as i32) / 2;
-                m.blit(&glyph_rows(*kind), 16, x, gy, gs);
-                x += glyph_w as i32;
-            }
-        }
+        let gy = (height as i32 - (16 * gs) as i32) / 2;
+        m.blit(&glyph_rows(*kind), 16, x, gy, gs);
+        x += glyph_w as i32;
         x += gap as i32;
         if let Some(t) = &labels[i] {
             m.draw(t, x, (height as i32 - t.h as i32) / 2);
@@ -508,10 +487,9 @@ mod tests {
     #[test]
     fn strip_spans_cover_the_drawn_segments() {
         let mut font = OsFont::new(Box::new(BoxFont));
-        let mut icons = OsFont::new(Box::new(BoxFont));
         let style = TextStyle { fill: 0xFF_FFFF, outline: false };
         for (cpu, gpu) in [(Some(Some(5)), Some(Some(54))), (Some(Some(100)), Some(None)), (None, Some(Some(61)))] {
-            let strip = render_text_strip(cpu, gpu, 12, 20, Some(&mut font), Some(&mut icons), style);
+            let strip = render_text_strip(cpu, gpu, 12, 20, Some(&mut font), style);
             let c = &strip.canvas;
             assert_eq!(strip.spans[0].is_some(), cpu.is_some());
             assert_eq!(strip.spans[1].is_some(), gpu.is_some());
