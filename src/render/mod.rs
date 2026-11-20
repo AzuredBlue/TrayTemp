@@ -128,6 +128,11 @@ impl Mask {
     /// Draw a 1-bit bitmap (`width` columns, leftmost pixel is the highest bit)
     /// at (x, y), scaled by an integer factor. Pixels outside the mask are skipped.
     fn blit(&mut self, rows: &[u32], width: u32, x: i32, y: i32, scale: u32) {
+        self.blit_at(rows, width, x, y, scale, 255);
+    }
+
+    /// `blit`, setting the drawn pixels' coverage to `value`.
+    fn blit_at(&mut self, rows: &[u32], width: u32, x: i32, y: i32, scale: u32, value: u8) {
         for (r, &row) in rows.iter().enumerate() {
             for c in 0..width {
                 if row >> (width - 1 - c) & 1 == 0 {
@@ -138,7 +143,7 @@ impl Mask {
                         let px = x + (c * scale + dx) as i32;
                         let py = y + (r as u32 * scale + dy) as i32;
                         if let Some(i) = self.index(px, py) {
-                            self.a[i] = 255;
+                            self.a[i] = value;
                         }
                     }
                 }
@@ -279,16 +284,22 @@ fn os_number(f: &mut OsFont, value: Option<i32>, room: u32) -> Option<AlphaMask>
     f.raster.rasterize(&text, px)
 }
 
-fn glyph_rows(kind: Kind) -> [u32; 16] {
-    let src = match kind {
-        Kind::Cpu => &glyphs::CPU,
-        Kind::Gpu => &glyphs::GPU,
-    };
+fn widen16(src: &[u16; 16]) -> [u32; 16] {
     let mut out = [0; 16];
     for (o, &r) in out.iter_mut().zip(src) {
         *o = r as u32;
     }
     out
+}
+
+/// Draws `kind`'s glyph at (x, y), scaled by `s`, with its dimmed pixels at `glyphs::DIM`.
+fn blit_glyph(m: &mut Mask, kind: Kind, x: i32, y: i32, s: u32) {
+    let (rows, dim) = match kind {
+        Kind::Cpu => (&glyphs::CPU, &glyphs::CPU_DIM),
+        Kind::Gpu => (&glyphs::GPU, &glyphs::GPU_DIM),
+    };
+    m.blit(&widen16(rows), 16, x, y, s);
+    m.blit_at(&widen16(dim), 16, x, y, s, glyphs::DIM);
 }
 
 fn glyph_scale(size: u32) -> u32 {
@@ -300,7 +311,7 @@ pub fn render_glyph(kind: Kind, size: u32) -> Canvas {
     let s = glyph_scale(size);
     let mut m = Mask::new(size, size);
     let off = (size as i32 - (16 * s) as i32) / 2;
-    m.blit(&glyph_rows(kind), 16, off, off, s);
+    blit_glyph(&mut m, kind, off, off, s);
     m.into_canvas(OUTLINED)
 }
 
@@ -382,7 +393,7 @@ pub fn render_text_strip(
         let start = x;
         x += pad as i32;
         let gy = (height as i32 - (16 * gs) as i32) / 2;
-        m.blit(&glyph_rows(*kind), 16, x, gy, gs);
+        blit_glyph(&mut m, *kind, x, gy, gs);
         x += glyph_w as i32;
         x += gap as i32;
         if let Some(t) = &labels[i] {
