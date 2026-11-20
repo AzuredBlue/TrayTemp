@@ -30,11 +30,11 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, IDOK, IDYES, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND, MB_YESNO,
-    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, MSGFLT_ALLOW, PBT_POWERSETTINGCHANGE, SM_CXSMICON,
-    SPI_SETWORKAREA, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL,
+    FindWindowW, GetMessageW, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
+    IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL,
+    MB_SETFOREGROUND, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, MSGFLT_ALLOW,
+    PBT_POWERSETTINGCHANGE, SMTO_ABORTIFHUNG, SM_CXSMICON, SPI_SETWORKAREA, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NULL,
     WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -72,8 +72,14 @@ const WM_TASKBAR_MOVED: u32 = WM_APP + 7;
 /// Posted by a strip window: wParam is the strip, lParam the hovered sensor's index + 1 (0:
 /// none). Any program can post it, so both are checked.
 const WM_STRIP_HOVER: u32 = WM_APP + 8;
+/// Posted to ourselves once a newer TrayTemp asked to take over (see `TAKE_OVER`).
+const WM_TAKE_OVER_EXIT: u32 = WM_APP + 9;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Sent by a starting TrayTemp to the running one, wParam its `version_code`: the running one
+/// answers 1 and exits when the sender is newer, so starting a downloaded update replaces it.
+/// Any program can send it; the worst it can do is make TrayTemp exit.
+static TAKE_OVER: AtomicU32 = AtomicU32::new(0);
 // Worker results wait here, and the messages above carry nothing: any program of the same
 // user can post them to us, with any parameters.
 static AUTOSTART_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -627,14 +633,40 @@ fn has_arg(name: &str) -> bool {
     std::env::args_os().skip(1).any(|a| a == name)
 }
 
+/// `major.minor.patch` packed so that a newer version is a larger number; 10 bits each.
+fn version_code(v: &str) -> usize {
+    let mut parts = v.split(['.', '-', '+']).map(|p| p.parse::<usize>().unwrap_or(0).min(1023));
+    let mut part = || parts.next().unwrap_or(0);
+    part() << 20 | part() << 10 | part()
+}
+
+/// Asks the running instance to make way for this one; true if it agreed (it is older, and no
+/// driver step is under way) and is now exiting.
+fn ask_to_take_over() -> bool {
+    // SAFETY: plain queries and a sent message with a timeout; the result is a local.
+    unsafe {
+        let running = FindWindowW(w!("TrayTempWindow"), null());
+        if running.is_null() {
+            return false;
+        }
+        let msg = RegisterWindowMessageW(w!("TrayTemp.TakeOver"));
+        let mut answer = 0;
+        let code = version_code(env!("CARGO_PKG_VERSION"));
+        let sent = SendMessageTimeoutW(running, msg, code, 0, SMTO_ABORTIFHUNG, 5000, &mut answer);
+        sent != 0 && answer == 1
+    }
+}
+
 /// Claims this session's single TrayTemp instance, so autostart plus a manual start can't show
 /// the icons twice. The mutex handle stays open until the process exits. False when another
 /// instance runs; one that runs elevated denies us access to its mutex, which counts too.
+/// A running older version is asked to exit instead (`ask_to_take_over`).
 /// An elevated relaunch starts while the instance that launched it is still exiting, so it
-/// waits up to 10 s for that one to go.
+/// waits up to 10 s for that one to go; so does an instance that an older one made way for.
 fn claim_single_instance() -> bool {
-    let tries = if has_arg("--elevated") { 100 } else { 1 };
-    for i in 0..tries {
+    let mut tries = if has_arg("--elevated") { 100 } else { 1 };
+    let mut i = 0;
+    while i < tries {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -645,18 +677,21 @@ fn claim_single_instance() -> bool {
             (m, GetLastError())
         };
         if mutex.is_null() {
-            if err == ERROR_ACCESS_DENIED {
-                continue;
+            if err != ERROR_ACCESS_DENIED {
+                // Anything else: run without the guard rather than not at all.
+                return true;
             }
-            // Anything else: run without the guard rather than not at all.
+        } else if err != ERROR_ALREADY_EXISTS {
             return true;
+        } else {
+            // SAFETY: our own handle to the other instance's mutex, closed once so the object
+            // can go away when that instance exits.
+            unsafe { CloseHandle(mutex) };
         }
-        if err != ERROR_ALREADY_EXISTS {
-            return true;
+        if i == 0 && ask_to_take_over() {
+            tries = 100;
         }
-        // SAFETY: our own handle to the other instance's mutex, closed once so the object
-        // can go away when that instance exits.
-        unsafe { CloseHandle(mutex) };
+        i += 1;
     }
     false
 }
@@ -800,6 +835,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // SAFETY: ends our message loop.
             unsafe { PostQuitMessage(0) };
         }
+        // Sent, so the answer only decides; the exit happens from the queue, where no handler
+        // up the stack holds the state. While a driver step runs, its result must not be lost.
+        m if m != 0 && m == TAKE_OVER.load(Ordering::Relaxed) => {
+            if BUSY.get() || wp <= version_code(env!("CARGO_PKG_VERSION")) {
+                return 0;
+            }
+            // SAFETY: plain post to our own window.
+            unsafe { PostMessageW(hwnd, WM_TAKE_OVER_EXIT, 0, 0) };
+            return 1;
+        }
+        WM_TAKE_OVER_EXIT => {
+            if with_state(|_| ()).is_some() {
+                // SAFETY: the state is in place, so WM_DESTROY can clean it up.
+                unsafe { DestroyWindow(hwnd) };
+            } else {
+                // SAFETY: plain post to our own window.
+                unsafe { PostMessageW(hwnd, msg, 0, 0) };
+            }
+        }
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             run_or_repost(hwnd, msg, wp, lp, |st| {
                 st.tray.readd_all();
@@ -873,11 +927,15 @@ pub fn run() {
     if hwnd.is_null() {
         return;
     }
-    // SAFETY: registers a named message and lets it through UIPI when running elevated.
+    // SAFETY: registers named messages and lets them through UIPI when running elevated.
     unsafe {
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         TASKBAR_CREATED.store(taskbar_created, Ordering::Relaxed);
         ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, null_mut());
+        // An update is usually started unelevated, and this instance may run elevated.
+        let take_over = RegisterWindowMessageW(w!("TrayTemp.TakeOver"));
+        TAKE_OVER.store(take_over, Ordering::Relaxed);
+        ChangeWindowMessageFilterEx(hwnd, take_over, MSGFLT_ALLOW, null_mut());
     }
 
     app.tick();
@@ -916,5 +974,19 @@ pub fn run() {
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_code;
+
+    #[test]
+    fn newer_versions_have_larger_codes() {
+        let order = ["0.1.1", "0.1.2", "0.1.10", "0.2.0", "1.0.0", "10.0.0"];
+        for w in order.windows(2) {
+            assert!(version_code(w[0]) < version_code(w[1]), "{} < {}", w[0], w[1]);
+        }
+        assert_eq!(version_code("0.1.2-beta"), version_code("0.1.2"));
     }
 }

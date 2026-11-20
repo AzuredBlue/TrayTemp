@@ -17,6 +17,8 @@ Windows memory is the private working set (Task Manager, Details, "Memory" colum
 
 TrayTemp is a single executable (`traytemp.exe` on Windows, `traytemp-linux-x86_64` on Linux). There is no installer: download it and run it. On Linux, make it executable first (`chmod +x traytemp-linux-x86_64`). Releases are attached to the tags of this repository.
 
+To update on Windows, run the new exe: it closes an older TrayTemp that is running and takes its place, and with "Start with Windows" on it also replaces the copy in Program Files. This works from version 0.1.2 on; to leave 0.1.1, exit it from its menu first.
+
 ## Screenshots
 
 Windows, tray icons:
