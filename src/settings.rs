@@ -64,6 +64,8 @@ fn parse_bool(v: &str) -> Option<bool> {
 impl Settings {
     pub fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
+        // An editor may have saved it with a byte-order mark, which would hide the first key.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -159,11 +161,17 @@ pawnio_installed_by_traytemp={}
         }
     }
 
+    /// Written to a temporary file and renamed over the old one, so a crash mid-write never
+    /// leaves an empty file (whose defaults would switch autostart off).
     fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, self.to_ini())
+        let tmp = path.with_extension("ini.tmp");
+        std::fs::write(&tmp, self.to_ini())?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 }
 
