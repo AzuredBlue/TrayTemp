@@ -326,8 +326,15 @@ pub struct Strip {
 /// closest is a monitor), so the GPU icon is always the bitmap one.
 pub const ICON_CODE_POINTS: [Option<char>; 2] = [Some('\u{E950}'), None];
 
+/// Padding at each end of a strip span, for text at `px`: the room a hover highlight needs.
+pub fn strip_pad(px: u32) -> u32 {
+    px / 2
+}
+
 /// Taskbar-text strip: `[icon] number` per enabled sensor (outer `None` = disabled), text at
-/// `px` (em height) in a canvas `height` tall; width 0 if none are enabled.
+/// `px` (em height) in a canvas `height` tall; width 0 if none are enabled. Every span has
+/// `strip_pad(px)` of room at both ends, and the gap between spans is shortened to match, so the
+/// text sits where it would without padding.
 /// `font` draws the labels and `icons` the sensor icons (see `ICON_CODE_POINTS`); without them
 /// the bitmap digits and glyphs are used.
 pub fn render_text_strip(
@@ -353,7 +360,8 @@ pub fn render_text_strip(
     let gs = (px / 12).max(1);
     let glyph_w = 16 * gs;
     let gap = px / 2;
-    let group_gap = px * 3 / 2;
+    let pad = strip_pad(px);
+    let group_gap = (px * 3 / 2).saturating_sub(2 * pad);
     let margin = u32::from(style.outline);
 
     let mut width = 0;
@@ -364,6 +372,7 @@ pub fn render_text_strip(
             width += group_gap;
         }
         count += 1;
+        width += 2 * pad;
         width += icon_masks[i].as_ref().map_or(glyph_w, |m| m.w) + gap;
         width += labels[i].as_ref().map_or(number_cells(*v, false) * s, |t| t.w);
     }
@@ -382,6 +391,7 @@ pub fn render_text_strip(
         }
         first = false;
         let start = x;
+        x += pad as i32;
         match &icon_masks[i] {
             Some(t) => {
                 m.draw(t, x, (height as i32 - t.h as i32) / 2);
@@ -401,9 +411,51 @@ pub fn render_text_strip(
             let ty = (height as i32 - (7 * s) as i32) / 2;
             x = draw_number(&mut m, *v, x, ty, s, false);
         }
+        x += pad as i32;
         spans[i] = Some((start as u32, x as u32));
     }
     Strip { canvas: m.into_canvas(style), spans }
+}
+
+/// `c` with a rounded rectangle of colour `argb` (0xAARRGGBB, straight alpha) drawn *under* its
+/// pixels: columns `a..z` of `span`, rows `inset..h - inset`, corners of `radius` px with
+/// anti-aliased edges. Same size as `c`.
+pub fn under_highlight(c: &Canvas, span: (u32, u32), inset: u32, radius: f32, argb: u32) -> Canvas {
+    let (x0, x1) = (span.0 as f32, span.1 as f32);
+    let (y0, y1) = (inset as f32, c.h.saturating_sub(inset) as f32);
+    let (hw, hh) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+    let (cx, cy) = (x0 + hw, y0 + hh);
+    let r = radius.min(hw).min(hh).max(0.0);
+    let hl = argb >> 24;
+    let mut px = c.px.clone();
+    for y in 0..c.h {
+        for x in 0..c.w {
+            // Distance from the pixel centre to the rounded rectangle's edge, negative inside.
+            let qx = ((x as f32 + 0.5 - cx).abs() - (hw - r)).max(0.0);
+            let qy = ((y as f32 + 0.5 - cy).abs() - (hh - r)).max(0.0);
+            let inside = (x as f32 + 0.5 - cx).abs() <= hw && (y as f32 + 0.5 - cy).abs() <= hh;
+            if !inside {
+                continue;
+            }
+            let cover = (0.5 - ((qx * qx + qy * qy).sqrt() - r)).clamp(0.0, 1.0);
+            let ba = (hl as f32 * cover + 0.5) as u32;
+            let i = (y * c.w + x) as usize;
+            let top = px[i];
+            let ta = top >> 24;
+            // `top` over the highlight, straight alpha.
+            let a = ta + (ba * (255 - ta) + 127) / 255;
+            if a == 0 {
+                continue;
+            }
+            let channel = |shift: u32| {
+                let t = (top >> shift & 0xFF) * ta;
+                let b = (argb >> shift & 0xFF) * ((ba * (255 - ta) + 127) / 255);
+                (t + b + a / 2) / a
+            };
+            px[i] = a << 24 | channel(16) << 16 | channel(8) << 8 | channel(0);
+        }
+    }
+    Canvas { w: c.w, h: c.h, px }
 }
 
 #[cfg(test)]
@@ -468,11 +520,25 @@ mod tests {
                 let inside = strip.spans.iter().flatten().any(|&(a, b)| (a..b).contains(&x));
                 assert!(inside || !inked(x), "ink outside the spans at {x}");
             }
+            let pad = strip_pad(12);
             for &(a, b) in strip.spans.iter().flatten() {
                 assert!((a..b).any(inked), "empty span");
-                // The label is the last thing in a span and fills its end.
-                assert!(inked(b - 1));
+                // The padding at both ends is clear, and the label fills right up to it.
+                assert!((a..a + pad).all(|x| !inked(x)) && (b - pad..b).all(|x| !inked(x)));
+                assert!(inked(b - pad - 1));
             }
         }
+    }
+
+    #[test]
+    fn highlight_goes_under_the_ink() {
+        let mut c = Canvas { w: 20, h: 20, px: vec![0; 400] };
+        c.px[10 * 20 + 10] = 0xFF_FF0000;
+        let h = under_highlight(&c, (2, 18), 4, 4.0, 0x0F_FFFFFF);
+        assert_eq!((h.w, h.h, h.px.len()), (20, 20, 400));
+        assert_eq!(h.px[10 * 20 + 10], 0xFF_FF0000, "ink survives");
+        assert_eq!(h.px[8 * 20 + 6], 0x0F_FFFFFF, "interior is filled");
+        assert_eq!(h.px[4 * 20 + 2] >> 24, 0, "corner stays clear");
+        assert_eq!(h.px[2 * 20 + 10], 0, "outside the rows stays clear");
     }
 }

@@ -29,6 +29,8 @@ use super::WM_UIA_MOVED;
 /// How often the positions are read.
 const POLL: Duration = Duration::from_secs(1);
 const RETRY_AFTER_MISS: Duration = Duration::from_secs(10);
+/// The wait after a poke: UI Automation bounds can lag the layout change that caused it.
+const AFTER_POKE: Duration = Duration::from_millis(250);
 
 struct Slot {
     /// Gets `WM_UIA_MOVED`.
@@ -38,6 +40,8 @@ struct Slot {
     generation: u32,
     paused: bool,
     stop: bool,
+    /// The taskbar's tray moved: read the positions now instead of at the next poll.
+    poke: bool,
     /// A worker thread exists and has not yet seen `stop` (see `worker`).
     running: bool,
     /// Per taskbar, the screen x of the tray's left edge; taskbars without a value are absent.
@@ -50,6 +54,7 @@ static SLOT: Mutex<Slot> = Mutex::new(Slot {
     generation: 0,
     paused: false,
     stop: true,
+    poke: false,
     running: false,
     left: Vec::new(),
 });
@@ -75,6 +80,15 @@ pub fn set_paused(paused: bool) {
     let mut g = SLOT.lock().unwrap();
     g.paused = paused;
     WAKE.notify_all();
+}
+
+/// Has the worker read the positions now, and once more after `AFTER_POKE`.
+pub fn poke() {
+    let mut g = SLOT.lock().unwrap();
+    if !g.stop {
+        g.poke = true;
+        WAKE.notify_all();
+    }
 }
 
 /// The screen x where `taskbar`'s tray starts, if it is known.
@@ -297,9 +311,10 @@ fn run() {
     let mut failed = false;
     let mut tracked: Vec<Tracked> = Vec::new();
     loop {
-        let (stop, generation, paused, bars) = {
-            let g = SLOT.lock().unwrap();
-            (g.stop, g.generation, g.paused, g.bars.clone())
+        let (stop, generation, paused, bars, poked) = {
+            let mut g = SLOT.lock().unwrap();
+            let poked = std::mem::take(&mut g.poke);
+            (g.stop, g.generation, g.paused, g.bars.clone(), poked)
         };
         if stop {
             let mut g = SLOT.lock().unwrap();
@@ -350,6 +365,7 @@ fn run() {
             }
         }
         let g = SLOT.lock().unwrap();
+        let wait = if poked { AFTER_POKE } else { POLL };
         if paused || failed {
             // Nothing to do until the list, the pause or the stop changes.
             let _g = WAKE
@@ -357,7 +373,7 @@ fn run() {
                 .unwrap();
         } else {
             let _g = WAKE
-                .wait_timeout_while(g, POLL, |g| !g.stop && g.generation == generation && !g.paused)
+                .wait_timeout_while(g, wait, |g| !g.stop && g.generation == generation && !g.paused && !g.poke)
                 .unwrap();
         }
     }

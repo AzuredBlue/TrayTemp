@@ -51,6 +51,10 @@ use tray::{TrayIcons, WM_TRAY};
 
 const KINDS: [Kind; 2] = [Kind::Cpu, Kind::Gpu];
 const TIMER_ID: usize = 1;
+/// One-shot timer that looks at the taskbars once more after they moved, for neighbours that
+/// re-place themselves a moment later.
+const RECHECK_TIMER: usize = 2;
+const RECHECK_MS: u32 = 1200;
 /// Posted to ourselves: wParam is 1 when the display came on, 0 when it went off.
 const WM_DISPLAY_STATE: u32 = WM_APP + 2;
 /// Posted to ourselves: the tray icon size, the UI font or the taskbar theme may have changed.
@@ -62,6 +66,12 @@ const WM_FLOW_DONE: u32 = WM_APP + 5;
 /// Posted by the tray-position worker (see `uia`) once a taskbar's tray moved; it has put the
 /// positions in its slot.
 const WM_UIA_MOVED: u32 = WM_APP + 6;
+/// Posted by the taskbar hook (see `taskbar::on_event`) when a window in Explorer's taskbar
+/// moved or resized. Carries nothing.
+const WM_TASKBAR_MOVED: u32 = WM_APP + 7;
+/// Posted by a strip window: wParam is the strip, lParam the hovered sensor's index + 1 (0:
+/// none). Any program can post it, so both are checked.
+const WM_STRIP_HOVER: u32 = WM_APP + 8;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 // Worker results wait here, and the messages above carry nothing: any program of the same
@@ -91,6 +101,8 @@ struct State {
     text: Option<TaskbarText>,
     /// Taskbar text was tried and the main taskbar can't take it: the mode is greyed out.
     text_failed: bool,
+    /// `RECHECK_TIMER` is running.
+    recheck_armed: bool,
 }
 
 thread_local! {
@@ -175,6 +187,25 @@ impl State {
     fn tick(&mut self) {
         let changes = self.app.tick();
         self.apply(changes);
+    }
+
+    /// A taskbar window moved: looks at the strips' places now, and once more shortly after,
+    /// when neighbours that follow the tray have moved too. Events during that wait don't
+    /// extend it.
+    fn taskbar_moved(&mut self) {
+        if self.with_text(|t, app, look| t.check(app, look, false)).is_none() || self.recheck_armed {
+            return;
+        }
+        // SAFETY: a one-shot timer on our window.
+        self.recheck_armed = unsafe { SetTimer(self.hwnd, RECHECK_TIMER, RECHECK_MS, None) } != 0;
+    }
+
+    /// The re-check timer fired: ends it and looks at the strips' places, without sampling.
+    fn recheck_taskbars(&mut self) {
+        // SAFETY: stops our own timer.
+        unsafe { KillTimer(self.hwnd, RECHECK_TIMER) };
+        self.recheck_armed = false;
+        self.with_text(|t, app, look| t.check(app, look, false));
     }
 
     fn start_timer(&self) {
@@ -375,8 +406,11 @@ impl State {
     }
 
     fn shutdown(&mut self) {
-        // SAFETY: stops our own timer.
-        unsafe { KillTimer(self.hwnd, TIMER_ID) };
+        // SAFETY: stops our own timers.
+        unsafe {
+            KillTimer(self.hwnd, TIMER_ID);
+            KillTimer(self.hwnd, RECHECK_TIMER);
+        }
         power::unregister_display_notifications(self.power);
         for k in KINDS {
             self.tray.remove(k);
@@ -700,9 +734,16 @@ fn install_driver(agreed: bool, relaunched: bool) -> Option<CpuStart> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         // Posted, never sent, so it can't re-enter a handler; nothing to do if it ever did.
-        WM_TIMER => {
-            with_state(State::tick);
-        }
+        WM_TIMER => match wp {
+            TIMER_ID => {
+                with_state(State::tick);
+            }
+            // If the state is busy the timer stays and fires again.
+            RECHECK_TIMER => {
+                with_state(State::recheck_taskbars);
+            }
+            _ => {}
+        },
         WM_TRAY => on_tray(hwnd, wp, lp),
         WM_POWERBROADCAST => {
             if wp as u32 == PBT_POWERSETTINGCHANGE {
@@ -724,7 +765,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, |st| st.recheck(wp != 0)),
         WM_UIA_MOVED => run_or_repost(hwnd, msg, wp, lp, |st| {
-            st.with_text(|t, app, look| t.redraw(app, look));
+            st.with_text(|t, app, look| t.check(app, look, false));
+        }),
+        WM_TASKBAR_MOVED => run_or_repost(hwnd, msg, wp, lp, |st| {
+            // Cleared first: a move during the check posts again. While the state is busy the
+            // flag stays set, and the repost carries the event.
+            taskbar::PENDING.store(false, Ordering::Release);
+            st.taskbar_moved();
+        }),
+        WM_STRIP_HOVER => run_or_repost(hwnd, msg, wp, lp, |st| {
+            let style = st.style;
+            if let Some(t) = &mut st.text {
+                t.hover(wp as HWND, lp as usize, style);
+            }
         }),
         // Each slot is taken in a statement of its own, so the lock is free again before the
         // handler, which may refill it or (with the message box) handle the next message.
@@ -841,6 +894,7 @@ pub fn run() {
         cpu_driver_failed,
         text: None,
         text_failed: false,
+        recheck_armed: false,
     };
     st.reload_font(st.style);
     if st.app.settings.display_mode != DisplayMode::TaskbarText || !st.try_text() {
