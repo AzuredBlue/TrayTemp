@@ -7,7 +7,10 @@
 //! other programs and for the UAC prompt. Errors come back to the window as a posted message.
 
 use std::ffi::{c_void, OsString};
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +30,11 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_HIDE};
 
 use super::elevation::{is_elevated, run_elevated_and_wait, wide, Relaunch};
@@ -449,27 +456,58 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Where the running exe is now. `current_exe()` is where it was at start, and a running exe can
+/// be renamed and another file put in its place.
+fn running_exe() -> Result<PathBuf, String> {
+    let mut buf = [0u16; 1024];
+    let mut n = buf.len() as u32;
+    // SAFETY: `n` is the buffer's length in units; on success it is the length written.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(GetCurrentProcess(), PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n)
+    };
+    if ok == 0 {
+        return Err("The exe path is unknown.".into());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buf[..n as usize])))
+}
+
+/// Opens the running exe with renames and writes blocked, so its bytes are what this process
+/// runs. Once the opened file can't be renamed, the running exe can only still have its name if
+/// it is that file.
+fn open_running_exe() -> Result<(PathBuf, File), String> {
+    let path = running_exe()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .map_err(|e| format!("TrayTemp could not read its own exe: {e}"))?;
+    if !running_exe()?.as_os_str().eq_ignore_ascii_case(path.as_os_str()) {
+        return Err("TrayTemp's exe was moved while it ran. Start it again.".into());
+    }
+    Ok((path, file))
+}
+
 /// Makes `dest` a copy of the running exe: nothing happens when that is where it runs from or
-/// the contents already match (length first, then the bytes), so an updated TrayTemp replaces
-/// an old copy and an identical one is not written again.
+/// the contents already match, so an updated TrayTemp replaces an old copy and an identical one
+/// is not written again. The bytes come from the open running exe, never from a path that
+/// another program could have swapped (the copy runs elevated at every logon).
 fn sync_copy(dest: &Path, dir: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("The exe path is unknown: {e}"))?;
+    let (exe, mut file) = open_running_exe()?;
     if same_file(&exe, dest) {
         return Ok(());
     }
-    let identical = || -> Option<bool> {
-        let (a, b) = (std::fs::metadata(&exe).ok()?, std::fs::metadata(dest).ok()?);
-        Some(a.len() == b.len() && std::fs::read(&exe).ok()? == std::fs::read(dest).ok()?)
-    };
-    if identical() == Some(true) {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("TrayTemp could not read its own exe: {e}"))?;
+    if std::fs::read(dest).is_ok_and(|old| old == bytes) {
         return Ok(());
     }
-    // Copied under a temporary name and then renamed over the old copy, so the task never
+    // Written under a temporary name and then renamed over the old copy, so the task never
     // points at a half-written exe, even if TrayTemp exits during the copy.
     let part = dest.with_extension("exe.part");
     std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::copy(&exe, &part))
-        .and_then(|_| std::fs::rename(&part, dest))
+        .and_then(|()| std::fs::write(&part, &bytes))
+        .and_then(|()| std::fs::rename(&part, dest))
         .map_err(|e| {
             let _ = std::fs::remove_file(&part);
             format!("TrayTemp could not be copied to Program Files: {e}")
