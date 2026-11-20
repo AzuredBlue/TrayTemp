@@ -50,7 +50,7 @@ GPU temperature needs neither the driver nor administrator rights.
 
 ## Uninstall
 
-1. Untick "Start with Windows". This removes the task, the `Run` value and the Program Files copy. If TrayTemp is running from that copy, delete `C:\Program Files\TrayTemp` by hand afterwards.
+1. Untick "Start with Windows". This removes the task and the `Run` value, and, when TrayTemp runs as administrator, the Program Files copy. If the copy is still there afterwards (or TrayTemp is running from it), delete `C:\Program Files\TrayTemp` by hand.
 2. Untick "Show CPU temperature". This offers to remove PawnIO, if TrayTemp installed it.
 3. Exit TrayTemp.
 4. Delete the exe and `%APPDATA%\TrayTemp`. On Linux, delete `~/.config/traytemp` and `~/.config/autostart/traytemp.desktop`.
