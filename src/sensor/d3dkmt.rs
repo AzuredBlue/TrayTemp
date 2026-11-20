@@ -94,20 +94,18 @@ impl Candidate {
     }
 }
 
-fn enum_adapters() -> Vec<D3DKMT_ADAPTERINFO> {
-    let mut e = D3DKMT_ENUMADAPTERS2 { NumAdapters: 0, pAdapters: std::ptr::null_mut() };
-    // SAFETY: first call with a null array only reports the count.
-    if unsafe { D3DKMTEnumAdapters2(&mut e) } != 0 || e.NumAdapters == 0 {
-        return Vec::new();
-    }
-    let mut list = vec![D3DKMT_ADAPTERINFO::default(); e.NumAdapters as usize];
-    e.pAdapters = list.as_mut_ptr();
+/// The adapters, in `list`: no allocation, since `read` looks for a lost adapter again.
+/// Sixteen is more than any real machine has; with more, the call fails and the list is empty.
+fn enum_adapters(list: &mut [D3DKMT_ADAPTERINFO; 16]) -> &[D3DKMT_ADAPTERINFO] {
+    let mut e = D3DKMT_ENUMADAPTERS2 {
+        NumAdapters: list.len() as u32,
+        pAdapters: list.as_mut_ptr(),
+    };
     // SAFETY: pAdapters has room for NumAdapters entries.
     if unsafe { D3DKMTEnumAdapters2(&mut e) } != 0 {
-        return Vec::new();
+        return &[];
     }
-    list.truncate(e.NumAdapters as usize);
-    list
+    &list[..(e.NumAdapters as usize).min(list.len())]
 }
 
 /// Picks the best non-software adapter: discrete first (HybridDiscrete, then larger
@@ -116,7 +114,8 @@ fn enum_adapters() -> Vec<D3DKMT_ADAPTERINFO> {
 /// discrete GPU, which means it sleeps.
 fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
     let mut best: Option<Candidate> = None;
-    for info in enum_adapters() {
+    let mut list = [D3DKMT_ADAPTERINFO::default(); 16];
+    for info in enum_adapters(&mut list) {
         let h = info.hAdapter;
         let mut ty = D3DKMT_ADAPTERTYPE::default();
         let flags = if query(h, KMTQAITYPE_ADAPTERTYPE, &mut ty) {
