@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::core::{BSTR, GUID};
 use windows_sys::Win32::Foundation::{SysFreeString, HWND, RECT};
@@ -28,6 +28,7 @@ use super::WM_UIA_MOVED;
 
 /// How often the positions are read.
 const POLL: Duration = Duration::from_secs(1);
+const RETRY_AFTER_MISS: Duration = Duration::from_secs(10);
 
 struct Slot {
     /// Gets `WM_UIA_MOVED`.
@@ -251,6 +252,9 @@ fn find(auto: &Com<Automation>, taskbar: isize) -> Option<(Com<Element>, i32)> {
 struct Tracked {
     taskbar: isize,
     element: Option<(Com<Element>, i32)>,
+    /// After a search that found nothing, the next one waits until then: a search walks the
+    /// whole taskbar across processes, too much for every second.
+    retry_at: Option<Instant>,
 }
 
 /// Reads every tracked taskbar once and returns the tray edges found.
@@ -264,8 +268,9 @@ fn poll(auto: &Com<Automation>, tracked: &mut [Tracked]) -> Vec<(isize, i32)> {
                 t.element = None;
             }
         }
-        if t.element.is_none() {
+        if t.element.is_none() && t.retry_at.is_none_or(|at| Instant::now() >= at) {
             t.element = find(auto, t.taskbar);
+            t.retry_at = t.element.is_none().then(|| Instant::now() + RETRY_AFTER_MISS);
         }
         if let Some((_, left)) = &t.element {
             out.push((t.taskbar, *left));
@@ -308,7 +313,10 @@ fn run() {
         }
         if seen != Some(generation) {
             seen = Some(generation);
-            tracked = bars.into_iter().map(|taskbar| Tracked { taskbar, element: None }).collect();
+            tracked = bars
+                .into_iter()
+                .map(|taskbar| Tracked { taskbar, element: None, retry_at: None })
+                .collect();
             failed = false;
         }
         if !paused && !failed {
