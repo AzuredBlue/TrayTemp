@@ -209,8 +209,8 @@ pub fn run_elevated_and_wait(exe: &Path, args: &str, show: i32) -> Result<u32, R
 mod tests {
     use super::*;
 
-    /// Elevated (as on GitHub's Windows runners) it also checks that a write as the user is
-    /// refused in a folder only administrators may write to.
+    /// When run elevated, it also checks that a write as the user is refused in a folder only
+    /// administrators may write to.
     #[test]
     fn as_user_writes_with_the_users_rights_only() {
         let dir = std::env::temp_dir().join(format!("traytemp-as-user-{}", std::process::id()));
