@@ -411,33 +411,6 @@ fn font_file(family: &CStr) -> Option<(CString, c_long)> {
     }
 }
 
-/// Crops a w x h coverage buffer to its ink.
-fn crop(a: &[u8], w: u32, h: u32) -> AlphaMask {
-    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
-    for y in 0..h {
-        for x in 0..w {
-            if a[(y * w + x) as usize] != 0 {
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
-            }
-        }
-    }
-    if x0 >= x1 {
-        return AlphaMask {
-            w: 0,
-            h: 0,
-            a: Vec::new(),
-        };
-    }
-    let mut out = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
-    for y in y0..y1 {
-        out.extend_from_slice(&a[(y * w + x0) as usize..(y * w + x1) as usize]);
-    }
-    AlphaMask {
-        w: x1 - x0,
-        h: y1 - y0,
-        a: out,
-    }
-}
 
 impl TextRasterizer for FtText {
     fn rasterize(&mut self, text: &str, px: u32) -> Option<AlphaMask> {
@@ -494,7 +467,7 @@ impl TextRasterizer for FtText {
             }
             pen += slot.advance.x;
         }
-        Some(crop(&a, w, h))
+        Some(AlphaMask::cropped(&a, w, h))
     }
 }
 
