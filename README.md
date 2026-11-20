@@ -43,7 +43,7 @@ GPU temperature needs neither the driver nor administrator rights.
 
 - **Settings file:** `%APPDATA%\TrayTemp\settings.ini` on Windows, `~/.config/traytemp/settings.ini` on Linux (or under `$XDG_CONFIG_HOME`).
 - **"Start with Windows":**
-  - With CPU temperature on: a Task Scheduler task named "TrayTemp" that runs with the highest privileges, and a copy of the exe at `C:\Program Files\TrayTemp\traytemp.exe`. The copy exists because an administrator task must never point at a file a normal user can modify.
+  - With CPU temperature on: a Task Scheduler task named "TrayTemp" that runs with the highest privileges, and a copy of the exe at `C:\Program Files\TrayTemp\traytemp.exe`. The copy exists because an administrator task must never point at a file a normal user can modify. Windows remembers where a tray icon sits per exe location, so after the first start from that copy you may need to drag the icon to where you want it once.
   - With CPU temperature off: a value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - **Linux autostart:** `~/.config/autostart/traytemp.desktop`.
 - **PawnIO**, if TrayTemp installed it.
