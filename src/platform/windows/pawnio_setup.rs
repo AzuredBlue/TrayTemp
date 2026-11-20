@@ -174,7 +174,7 @@ fn fresh_dir() -> Result<PathBuf, String> {
 /// inherited from the user's temp folder. The elevated installer runs from it, so this user's
 /// unelevated processes must not be able to place DLLs next to it, swap the downloaded file or,
 /// as its owner, change its access. Needs elevation.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut sd: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: a NUL-terminated SDDL literal; on success `sd` gets a LocalAlloc'd descriptor.
     let ok = unsafe {

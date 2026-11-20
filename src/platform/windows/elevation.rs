@@ -8,7 +8,11 @@ use std::ptr::{null, null_mut};
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, HANDLE};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, ImpersonateLoggedOnUser,
+    RevertToSelf, SetTokenInformation, TokenElevation, TokenOwner, TokenUser,
+    WinBuiltinAdministratorsSid, DISABLE_MAX_PRIVILEGE, SECURITY_MAX_SID_SIZE,
+    SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_OWNER,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
@@ -55,6 +59,74 @@ pub fn is_elevated() -> bool {
         ok
     };
     ok != 0 && elevation.TokenIsElevated != 0
+}
+
+/// Runs `f` on this thread without administrator rights: our own token with Administrators
+/// deny-only, no privileges, and the user as the owner of new files. For writes under the
+/// user's own folders from an elevated instance: a link planted there can't redirect them onto
+/// a file only an administrator may change. Unelevated, the token loses nothing it had.
+/// `None`, without running `f`, if that token can't be made.
+pub fn as_user<R>(f: impl FnOnce() -> R) -> Option<R> {
+    let mut token: HANDLE = null_mut();
+    // SAFETY: the current-process pseudo handle needs no closing; `token` is a valid out-pointer.
+    let access = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT;
+    if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) } == 0 {
+        return None;
+    }
+    let mut admins = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut admins_len = SECURITY_MAX_SID_SIZE;
+    // TOKEN_USER and the SID it points into; usize keeps the struct aligned.
+    let mut user = [0usize; 16];
+    let mut user_len = 0;
+    let mut restricted: HANDLE = null_mut();
+    // SAFETY: each buffer's size is passed with it, and `user` holds the TOKEN_USER (and its
+    // SID) that GetTokenInformation filled when it is read. Both tokens are closed once; the
+    // thread keeps its own reference to the impersonation token.
+    let ok = unsafe {
+        let ok = CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            null_mut(),
+            admins.as_mut_ptr().cast(),
+            &mut admins_len,
+        ) != 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                size_of_val(&user) as u32,
+                &mut user_len,
+            ) != 0
+            && {
+                let disable = SID_AND_ATTRIBUTES { Sid: admins.as_mut_ptr().cast(), Attributes: 0 };
+                let flags = DISABLE_MAX_PRIVILEGE;
+                CreateRestrictedToken(token, flags, 1, &disable, 0, null(), 0, null(), &mut restricted)
+                    != 0
+            }
+            && {
+                // An elevated token's default owner is Administrators, now deny-only.
+                let owner = TOKEN_OWNER { Owner: (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+                SetTokenInformation(
+                    restricted,
+                    TokenOwner,
+                    (&raw const owner).cast(),
+                    size_of::<TOKEN_OWNER>() as u32,
+                ) != 0
+            }
+            && ImpersonateLoggedOnUser(restricted) != 0;
+        CloseHandle(token);
+        if !restricted.is_null() {
+            CloseHandle(restricted);
+        }
+        ok
+    };
+    if !ok {
+        return None;
+    }
+    let r = f();
+    // SAFETY: ends the impersonation started above. If it ever failed, this thread would only
+    // keep fewer rights, never more.
+    unsafe { RevertToSelf() };
+    Some(r)
 }
 
 /// Starts `exe args` elevated through the UAC prompt, with the program's own folder as its
@@ -131,4 +203,27 @@ pub fn run_elevated_and_wait(exe: &Path, args: &str, show: i32) -> Result<u32, R
         return Err(Relaunch::Failed);
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Elevated (as on GitHub's Windows runners) it also checks that a write as the user is
+    /// refused in a folder only administrators may write to.
+    #[test]
+    fn as_user_writes_with_the_users_rights_only() {
+        let dir = std::env::temp_dir().join(format!("traytemp-as-user-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("mine.txt");
+        assert!(as_user(|| std::fs::write(&mine, "x")).unwrap().is_ok());
+        if is_elevated() {
+            let admins = dir.join("admins");
+            super::super::pawnio_setup::create_private_dir(&admins).unwrap();
+            let denied = as_user(|| std::fs::write(admins.join("a.txt"), "x")).unwrap();
+            assert_eq!(denied.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            std::fs::write(admins.join("b.txt"), "x").unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

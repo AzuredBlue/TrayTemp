@@ -321,7 +321,7 @@ impl State {
     fn cpu_started(&mut self, start: CpuStart) {
         if start.installed {
             self.app.settings.pawnio_installed_by_traytemp = true;
-            let _ = self.app.settings.save();
+            save(&self.app.settings);
         }
         self.cpu_driver_failed = start.failed;
         self.app.set_sensor(Kind::Cpu, start.sensor);
@@ -368,9 +368,8 @@ impl State {
                 None => return FollowUp::None,
             },
         };
-        // There is no console to report to; the menu keeps working without a saved file.
         // Saved before any relaunch, so the elevated instance starts from these settings.
-        let _ = self.app.settings.save();
+        save(&self.app.settings);
         follow
     }
 
@@ -496,7 +495,7 @@ fn on_flow_done(hwnd: HWND, done: FlowDone) {
         FlowDone::Uninstalled(removed) => {
             if removed {
                 st.app.settings.pawnio_installed_by_traytemp = false;
-                let _ = st.app.settings.save();
+                save(&st.app.settings);
             }
             Some(st.app.settings.clone())
         }
@@ -581,6 +580,12 @@ impl CpuStart {
             installed: false,
         })
     }
+}
+
+/// Saves without administrator rights, since the file lies in a folder the user controls.
+/// There is no console to report a failure to; the menu keeps working without a saved file.
+fn save(settings: &Settings) {
+    let _ = elevation::as_user(|| settings.save());
 }
 
 fn has_arg(name: &str) -> bool {
@@ -771,7 +776,7 @@ pub fn run() {
         };
         if start.installed {
             settings.pawnio_installed_by_traytemp = true;
-            let _ = settings.save();
+            save(&settings);
         }
         cpu = start.sensor;
         cpu_driver_failed = start.failed;
