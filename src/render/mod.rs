@@ -346,9 +346,11 @@ pub fn render_text_strip(
     let s = (px * 2 / 3 / 7).max(1);
     let gs = (px / 12).max(1);
     let glyph_w = 16 * gs;
-    let gap = px / 2;
+    // At px 12 (96 DPI) the ink gaps are 5 from glyph to number and 16 between groups, the
+    // tray icons' own spacing; the glyphs' blank edge column adds the 1.
+    let gap = px / 3;
     let pad = strip_pad(px);
-    let group_gap = (px * 3 / 2).saturating_sub(2 * pad);
+    let group_gap = (px * 5 / 4).saturating_sub(2 * pad);
     let margin = u32::from(style.outline);
 
     let mut width = 0;
