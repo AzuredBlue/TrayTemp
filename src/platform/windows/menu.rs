@@ -111,7 +111,7 @@ pub fn show(
         let autostart = flag(s.autostart, MF_CHECKED);
         item(menu, autostart, ID_AUTOSTART, w!("Start with Windows"));
         if cpu_driver_failed {
-            item(menu, 0, ID_RETRY_DRIVER, w!("Retry CPU driver install"));
+            item(menu, 0, ID_RETRY_DRIVER, w!("Retry CPU driver"));
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         item(menu, 0, ID_EXIT, w!("Exit"));
