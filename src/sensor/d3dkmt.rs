@@ -68,6 +68,7 @@ impl Sensor for D3dkmtSensor {
 struct Candidate {
     adapter: u32,
     has_temp: bool,
+    asleep: bool,
     discrete: bool,
     dedicated: u64,
     vendor: u32,
@@ -97,7 +98,7 @@ fn enum_adapters() -> Vec<D3DKMT_ADAPTERINFO> {
 
 /// Picks the best non-software adapter: discrete first (HybridDiscrete, then larger
 /// dedicated VRAM), then one with a valid temperature. Returns it with its vendor ID and
-/// whether it had a valid temperature at startup.
+/// whether D3DKMT reads it at startup: a valid temperature, or 0 while the GPU sleeps.
 fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
     let mut best: Option<Candidate> = None;
     for info in enum_adapters() {
@@ -125,9 +126,11 @@ fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
         } else {
             0
         };
+        let temp = read_temp(h);
         let c = Candidate {
             adapter: h,
-            has_temp: read_temp(h).is_some_and(valid_temp),
+            has_temp: temp.is_some_and(valid_temp),
+            asleep: temp == Some(0.0),
             discrete: flags & TYPE_HYBRID_DISCRETE != 0,
             dedicated,
             vendor,
@@ -142,14 +145,18 @@ fn pick() -> Option<(D3dkmtSensor, u32, bool)> {
             }
         }
     }
-    best.map(|b| (D3dkmtSensor { adapter: b.adapter }, b.vendor, b.has_temp))
+    best.map(|b| {
+        let sensor = D3dkmtSensor { adapter: b.adapter };
+        (sensor, b.vendor, b.has_temp || b.asleep)
+    })
 }
 
-/// D3DKMT on the preferred adapter. If it has no valid temperature at startup and is
-/// NVIDIA, NVML when available; otherwise D3DKMT is kept so it recovers when the GPU wakes.
+/// D3DKMT on the preferred adapter. If D3DKMT can't read it at startup and it is NVIDIA,
+/// NVML when available. A sleeping GPU (it reads 0) keeps D3DKMT, which recovers when the GPU
+/// wakes: NVML queries can wake a sleeping laptop GPU, and it would be queried every tick.
 pub fn open_gpu_sensor() -> Option<Box<dyn Sensor>> {
-    let (sensor, vendor, has_temp) = pick()?;
-    if !has_temp && vendor == VENDOR_NVIDIA {
+    let (sensor, vendor, readable) = pick()?;
+    if !readable && vendor == VENDOR_NVIDIA {
         if let Some(n) = NvmlSensor::open() {
             return Some(Box::new(n));
         }
