@@ -7,6 +7,7 @@ mod pawnio_setup;
 mod power;
 mod taskbar;
 mod tray;
+mod uia;
 
 use std::cell::Cell;
 use std::ptr::{null, null_mut};
@@ -57,6 +58,9 @@ const WM_RECHECK: u32 = WM_APP + 3;
 const WM_AUTOSTART_ERROR: u32 = WM_APP + 4;
 /// Posted by a flow worker (see `run_flow`) once it has put its result in `FLOW_DONE`.
 const WM_FLOW_DONE: u32 = WM_APP + 5;
+/// Posted by the tray-position worker (see `uia`) once a taskbar's tray moved; it has put the
+/// positions in its slot.
+const WM_UIA_MOVED: u32 = WM_APP + 6;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 // Worker results wait here, and the messages above carry nothing: any program of the same
@@ -191,6 +195,7 @@ impl State {
             return;
         }
         self.display_on = on;
+        uia::set_paused(!on);
         if on {
             self.start_timer();
             self.tick();
@@ -705,6 +710,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { PostMessageW(hwnd, WM_RECHECK, full, 0) };
         }
         WM_RECHECK => run_or_repost(hwnd, msg, wp, lp, |st| st.recheck(wp != 0)),
+        WM_UIA_MOVED => run_or_repost(hwnd, msg, wp, lp, |st| {
+            st.with_text(|t, app, look| t.redraw(app, look));
+        }),
         // Each slot is taken in a statement of its own, so the lock is free again before the
         // handler, which may refill it or (with the message box) handle the next message.
         WM_FLOW_DONE => {

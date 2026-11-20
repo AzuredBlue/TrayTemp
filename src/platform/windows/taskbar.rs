@@ -31,6 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::font;
+use super::uia;
 use super::tray::{copy_tip, TIP_LEN, WM_TRAY};
 use crate::app::{App, Changes};
 use crate::render::{render_text_strip, Canvas, OsFont, TextStyle};
@@ -46,6 +47,9 @@ const GAP: i32 = 8;
 const CLOCK_PAD: i32 = 12;
 /// A clock this wide (at 96 DPI) is assumed if the font can't be read.
 const CLOCK_FALLBACK: i32 = 62;
+/// Room kept for the notification bell's button (at 96 DPI) when the real tray position isn't
+/// known: Do Not Disturb adds it right of the clock and moves the clock left by its width.
+const BELL: i32 = 28;
 
 /// The label font and colours in use.
 pub struct Look<'a> {
@@ -295,14 +299,8 @@ impl TaskbarText {
         }
     }
 
-    /// Finds the taskbars again and rebuilds every strip: after Explorer restarts, or the
-    /// monitors, scaling or the "all taskbars" choice changed.
-    pub fn relayout(&mut self, all: bool, app: &App, look: &mut Look) {
-        self.all = all;
-        for b in &self.bars {
-            destroy_bar(b);
-        }
-        self.bars.clear();
+    /// Makes a strip for the main taskbar, and for the others if `all`.
+    fn find_bars(&mut self, all: bool) {
         // SAFETY: plain window lookups.
         unsafe {
             let main = FindWindowW(w!("Shell_TrayWnd"), null());
@@ -321,6 +319,27 @@ impl TaskbarText {
                 }
                 self.bars.extend(create_bar(prev));
             }
+        }
+    }
+
+    /// Has the tray-position worker follow the taskbars that have no notification window.
+    fn follow_trays(&self) {
+        let bars: Vec<HWND> = self.bars.iter().filter(|b| b.notify.is_null()).map(|b| b.taskbar).collect();
+        uia::set_targets(MAIN.load(Ordering::Relaxed) as HWND, &bars);
+    }
+
+    /// Finds the taskbars again and rebuilds every strip: after Explorer restarts, or the
+    /// monitors, scaling or the "all taskbars" choice changed.
+    pub fn relayout(&mut self, all: bool, app: &App, look: &mut Look) {
+        self.all = all;
+        for b in &self.bars {
+            destroy_bar(b);
+        }
+        self.bars.clear();
+        self.find_bars(all);
+        self.follow_trays();
+        if self.bars.is_empty() {
+            return;
         }
         self.set_tips(app);
         self.redraw(app, look);
@@ -369,12 +388,16 @@ impl TaskbarText {
                 look.style,
             );
             // The strip's right edge stays put as its width changes. It sits left of the
-            // notification area; where there is no such window, left of the clock.
-            let anchor = if b.notify.is_null() {
-                let text = ui.map_or(scale(CLOCK_FALLBACK, geo.dpi), |lf| font::clock_text_width(lf, px));
-                tw - text - 2 * scale(CLOCK_PAD, geo.dpi)
-            } else {
+            // notification area. Where there is no such window, it is the tray's left edge
+            // from UI Automation, or, until that is known, a guess from the clock's width
+            // that keeps room for the notification bell.
+            let anchor = if !b.notify.is_null() {
                 geo.notify[0] - geo.taskbar[0]
+            } else if let Some(x) = uia::tray_left(b.taskbar) {
+                x - geo.taskbar[0]
+            } else {
+                let text = ui.map_or(scale(CLOCK_FALLBACK, geo.dpi), |lf| font::clock_text_width(lf, px));
+                tw - text - 2 * scale(CLOCK_PAD, geo.dpi) - scale(BELL, geo.dpi)
             };
             let x = (anchor - scale(GAP, geo.dpi) - strip.canvas.w as i32).max(0);
             paint(b.win, x, &strip.canvas);
@@ -409,9 +432,14 @@ impl TaskbarText {
         }
         // A taskbar that was still being built when the strip was laid out gets its
         // notification area found now.
+        let mut found = false;
         for b in self.bars.iter_mut().filter(|b| b.notify.is_null()) {
             // SAFETY: plain lookup.
             b.notify = unsafe { FindWindowExW(b.taskbar, null_mut(), w!("TrayNotifyWnd"), null()) };
+            found |= !b.notify.is_null();
+        }
+        if found {
+            self.follow_trays();
         }
         let moved = self.bars.iter().any(|b| {
             let now = Geo {
@@ -428,6 +456,7 @@ impl TaskbarText {
     }
 
     pub fn destroy(self) {
+        uia::set_targets(null_mut(), &[]);
         for b in &self.bars {
             destroy_bar(b);
         }
