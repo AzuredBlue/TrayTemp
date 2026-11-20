@@ -33,7 +33,7 @@ KDE Plasma:
 
 ## Windows CPU temperature
 
-Reading the CPU temperature needs kernel access to CPU registers, which Windows does not offer to normal programs. TrayTemp uses [PawnIO](https://github.com/namazso/PawnIO.Setup), a signed driver by namazso, and therefore needs administrator rights when "Show CPU temperature" is on.
+Reading the CPU temperature needs kernel access to CPU registers, which Windows does not offer to normal programs. TrayTemp uses [PawnIO](https://github.com/namazso/PawnIO.Setup), a signed driver by namazso, and therefore needs administrator rights when "Show CPU temperature" is on. Use it from an administrator account: on a standard account, Windows runs TrayTemp as the administrator whose password was typed, with that administrator's settings and "Start with Windows".
 
 If the driver is missing, TrayTemp asks before it downloads the PawnIO installer from `github.com/namazso/PawnIO.Setup`, and it checks the installer's signature before running it.
 
