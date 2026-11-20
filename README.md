@@ -27,9 +27,13 @@ Windows, taskbar text:
 
 ![Windows taskbar text](assets/windows-taskbar-text.png)
 
-KDE Plasma:
+KDE Plasma 6, Breeze Light:
 
-![KDE light](assets/kde-light.png) ![KDE dark](assets/kde-dark.png)
+![KDE Plasma, Breeze Light](assets/kde-light.png)
+
+KDE Plasma 6, Breeze Dark:
+
+![KDE Plasma, Breeze Dark](assets/kde-dark.png)
 
 ## Windows CPU temperature
 
